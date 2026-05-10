@@ -35,26 +35,43 @@ def mk_isch(v):
 
 class p25p2_isch(object):
     def __init__(self):
-        self.isch_map = self.mk_isch_lookup()
+        self.isch_map, self.isch_codewords, self.isch_max_errors = self.mk_isch_lookup()
 
     def mk_isch_lookup(self):
         isch_map = {}
+        codeword_ints = []  # (int_value, isch_index) for Hamming-distance ECC
         g = np.array(np.asmatrix('1 0 0 0 1 0 0 0 0 0 0 1 0 1 1 0 1 1 0 0 1 1 1 0 0 0 1 1 0 1 1 0 1 1 0 1 0 1 1 1; 0 0 1 0 0 0 0 0 0 0 0 1 1 1 0 1 1 1 1 1 1 1 0 1 0 1 0 0 1 1 1 1 0 1 1 0 0 1 0 0; 0 0 0 1 0 0 0 0 0 0 0 0 1 1 1 1 0 1 0 0 1 0 1 1 0 0 0 1 0 1 1 1 0 1 0 1 1 0 0 0; 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 1 1 0 1 1 1 1 0 1 1 0 1 0 0 0 1 1 0 0 0 1 1 1 0; 0 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 1 1; 0 0 0 0 1 0 0 1 0 0 0 0 0 1 0 0 1 0 0 0 1 1 0 1 1 0 0 1 1 0 1 1 0 1 1 1 0 0 1 0; 0 0 0 0 0 0 0 0 1 0 0 1 1 1 0 1 1 0 1 0 0 0 1 1 1 0 1 0 0 0 0 1 0 1 1 1 0 0 0 1; 0 0 0 0 0 0 0 0 0 1 0 1 1 0 0 0 1 1 0 0 1 0 1 1 1 0 1 0 1 0 1 0 0 1 0 0 1 1 1 0; 0 0 0 0 0 0 0 0 0 0 1 1 0 1 0 0 0 0 1 1 1 1 0 1 1 0 0 0 0 1 0 1 1 0 0 1 0 1 1 1'))
         c0 = 0x184229d461
         for i in range(0, 2**7):
             codeword = mk_int(np.dot(mk_array(i, 9), g)) ^ c0
             isch_map['%x' % codeword] = i
-        return isch_map
+            codeword_ints.append((codeword, i))
+        # compute minimum Hamming distance to determine error correction capacity
+        min_dist = 40
+        for j in range(len(codeword_ints)):
+            for k in range(j + 1, len(codeword_ints)):
+                d = bin(codeword_ints[j][0] ^ codeword_ints[k][0]).count('1')
+                if d < min_dist:
+                    min_dist = d
+        max_errors = (min_dist - 1) // 2
+        return isch_map, codeword_ints, max_errors
 
     def decode_isch(self, syms):
         sync0 = 0x575d57f7ff
         v = mk_int(dibits_to_bits(syms))
         vp = '%x' % v
-        isch = 'unknown'
         if v == sync0:
             return -2, -2, -2, -2
         if vp in self.isch_map:
-            chn,loc,fr,cnt = mk_isch(self.isch_map[vp])
+            chn, loc, fr, cnt = mk_isch(self.isch_map[vp])
             return chn, loc, fr, cnt
-        # FIXME: if bit error(s), locate closest matching codeword
+        # find closest valid codeword via Hamming distance
+        best_dist, best_val = 41, None
+        for valid_int, val in self.isch_codewords:
+            dist = bin(v ^ valid_int).count('1')
+            if dist < best_dist:
+                best_dist, best_val = dist, val
+        if best_dist <= self.isch_max_errors:
+            chn, loc, fr, cnt = mk_isch(best_val)
+            return chn, loc, fr, cnt
         return -1, -1, -1, -1

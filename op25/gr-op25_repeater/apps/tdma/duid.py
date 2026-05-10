@@ -32,11 +32,13 @@ def extract_duid(b):
 
 def mk_duid_lookup():
     duid_map = {}
+    codeword_ints = []  # (int_value, duid_index) for Hamming-distance ECC
     g = np.array(np.asmatrix('1 0 0 0 1 1 0 1; 0 1 0 0 1 0 1 1; 0 0 1 0 1 1 1 0; 0 0 0 1 0 1 1 1'))
     for i in range(16):
         codeword = mk_str(np.dot(mk_array(i, 4), g))
         duid_map[codeword] = i
-    return duid_map
+        codeword_ints.append((int(codeword, 2), i))
+    return duid_map, codeword_ints
 
 class p25p2_duid(object):
     def __init__(self):
@@ -48,11 +50,21 @@ class p25p2_duid(object):
         self.duid_str[12] = "sacch w/o"
         self.duid_str[15] = "facch w/o"
 
-        self.duid_map = mk_duid_lookup()
+        self.duid_map, self.duid_codewords = mk_duid_lookup()
 
     def decode_duid(self, burst):
-        try:
-            b = self.duid_str[self.duid_map[extract_duid(burst)]]
-        except: # FIXME: find closest matching codeword
-            b = 'unknown' + extract_duid(burst)
-        return b
+        cw_str = extract_duid(burst)
+        duid_val = self.duid_map.get(cw_str)
+        if duid_val is None:
+            # [8,4] code d_min=4: correct up to 1-bit errors
+            cw_int = int(cw_str, 2)
+            best_dist, best_val = 9, None
+            for valid_int, val in self.duid_codewords:
+                dist = bin(cw_int ^ valid_int).count('1')
+                if dist < best_dist:
+                    best_dist, best_val = dist, val
+            if best_dist <= 1:
+                duid_val = best_val
+        if duid_val is not None:
+            return self.duid_str.get(duid_val, 'unknown' + cw_str)
+        return 'unknown' + cw_str
