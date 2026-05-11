@@ -1,5 +1,6 @@
 
 # P25 TDMA Decoder (C) Copyright 2013 KA1RBI
+# Error correction Copyright 2026 James Kirkham, K4JK   
 # 
 # This file is part of OP25
 # 
