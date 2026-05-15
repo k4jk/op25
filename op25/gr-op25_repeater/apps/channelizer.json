@@ -1,0 +1,11 @@
+{
+    "channelizer": {
+        "sample_rate_hz":   20000000,
+        "center_freq_hz":   851000000,
+        "channel_bw_hz":    12500,
+        "max_channels":     20,
+        "taps_per_phase":   12,
+        "control_port":     23457,
+        "status_port":      23458
+    }
+}
