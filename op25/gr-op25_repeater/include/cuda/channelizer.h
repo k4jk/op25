@@ -81,5 +81,14 @@ struct ChannelizerState {
     // ---- FM demodulator ----
     cufftComplex*   d_fm_prev;        // previous sample per channel [M] for ∆θ discriminator
     float*          d_fm_output;      // demodulated frequency [(L/D) * M], step-major (radians/sample)
+
+    // ---- Symbol timing recovery (Mueller-Müller clock recovery) ----
+    float*          d_mm_mu;          // fractional timing position [M], range ≈ [-(sps-1), sps)
+    float*          d_mm_fm_last;     // last FM sample from previous block [M] (for cross-block interp)
+    float*          d_mm_last_interp; // previous interpolated symbol value [M] (M&M error term)
+    float*          d_mm_last_dec;    // previous slicer decision [M] (M&M error term)
+    float*          d_mm_symbols;     // interpolated symbol values [MM_MAX_SYM * M], step-major
+    int8_t*         d_mm_dibits;      // decoded dibits 0-3 [MM_MAX_SYM * M], step-major
+    int32_t*        d_mm_sym_count;   // valid symbol count per channel [M]
 #endif
 };
