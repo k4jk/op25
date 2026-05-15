@@ -8,10 +8,13 @@
 #define INCLUDED_OP25_REPEATER_CUDA_CHANNELIZER_IMPL_H
 
 #include <gnuradio/op25_repeater/cuda_channelizer.h>
+#include <atomic>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
-#include <array>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -30,6 +33,7 @@ public:
                           int debug);
     ~cuda_channelizer_impl();
 
+    // ---- GR block interface ------------------------------------------------
     void forecast(int noutput_items,
                   gr_vector_int& ninput_items_required) override;
 
@@ -38,38 +42,69 @@ public:
                      gr_vector_const_void_star& input_items,
                      gr_vector_void_star& output_items) override;
 
+    // ---- Channel control (all thread-safe) ---------------------------------
+
+    // Assign a polyphase bin to output port [slot].
     void set_channel(int slot, float center_freq_hz) override;
+
+    // Deactivate output port [slot].
     void clear_channel(int slot) override;
 
-private:
-    int  d_max_channels;
-    int  d_debug;
-    int  d_M;          // num_phases (= polyphase bin count = FFT size)
-    int  d_input_len;  // complex samples per GPU batch (= L * M)
+    // Find the first free slot, set it to center_freq_hz, return its index
+    // (or -1 if all slots are occupied).
+    int alloc_slot(float center_freq_hz) override;
 
-    // slot_to_bin[slot] = polyphase bin index, or -1 if inactive
-    std::vector<int>   d_slot_to_bin;
-    std::mutex         d_slot_mutex;
+    // Release a slot back to the free pool.
+    void free_slot(int slot) override;
+
+private:
+    // ---- Slot state --------------------------------------------------------
+    int               d_max_channels;
+    int               d_debug;
+    int               d_M;          // polyphase bin count (= num_phases = FFT size)
+    int               d_input_len;  // complex samples per GPU batch
+
+    std::vector<int>  d_slot_to_bin;     // [max_channels]: bin index, or -1 inactive
+    std::vector<bool> d_slot_allocated;  // [max_channels]: true if alloc_slot owns it
+    std::mutex        d_slot_mutex;
 
     // Per-slot recovered dibit queues (drained to GR output buffers)
     std::vector<std::deque<uint8_t>> d_out_queues;
 
-    // CPU staging buffers (re-used each batch)
-    std::vector<int32_t> d_h_counts;   // [M] sym counts from GPU
-    std::vector<int8_t>  d_h_dibits;   // [MM_MAX_SYM * M] dibits from GPU
+    // CPU staging buffers (reused each batch)
+    std::vector<int32_t> d_h_counts;
+    std::vector<int8_t>  d_h_dibits;
+
+    // ---- UDP control listener ----------------------------------------------
+    int             d_ctrl_port;     // listen port
+    int             d_status_port;   // reply port (status / ACK)
+    std::thread     d_ctrl_thread;
+    std::atomic<bool> d_ctrl_running{false};
+
+    void ctrl_loop();          // runs in d_ctrl_thread
+    void handle_command(const std::string& json_in,
+                        int sock,
+                        const sockaddr_in& sender);
 
 #ifdef HAVE_CUDA
+    // ---- CUDA pipeline state -----------------------------------------------
     ChannelizerState   d_state;
-    cufftComplex*      d_gpu_in;       // [input_len] — IQ staging buffer on GPU
-    cufftComplex*      d_s1_scratch;   // [input_len] — stage-1 output buffer on GPU
+    cufftComplex*      d_gpu_in{nullptr};      // [input_len] IQ staging on GPU
+    cufftComplex*      d_s1_scratch{nullptr};   // [input_len] stage-1 output on GPU
     float              d_sdr_center_freq_hz;
     float              d_channel_bw_hz;
 
-    // Allocate the full pipeline (called from constructor).
+    // One CUDA stream per slot — allows future async per-channel work to
+    // overlap.  The full pipeline batch uses d_pipeline_stream.
+    std::vector<cudaStream_t> d_slot_streams;  // [max_channels]
+    cudaStream_t              d_pipeline_stream{nullptr};
+
     bool alloc_pipeline(const std::string& config_path);
-    // Run one GPU batch; results land in d_out_queues.
     void run_gpu_batch(const void* cpu_iq_buf);
     void free_pipeline();
+
+    // Frequency → polyphase bin (wraps into [0, M))
+    int freq_to_bin(float freq_hz) const;
 #endif
 };
 

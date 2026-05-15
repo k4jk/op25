@@ -35,5 +35,13 @@ void bind_cuda_channelizer(py::module& m)
 
         .def("clear_channel", &cuda_channelizer::clear_channel,
              py::arg("slot"),
-             "Deactivate a channel slot (output port emits zeros).");
+             "Deactivate a channel slot (output port emits zeros).")
+
+        .def("alloc_slot", &cuda_channelizer::alloc_slot,
+             py::arg("center_freq_hz"),
+             "Allocate the next free slot for center_freq_hz; returns slot index or -1.")
+
+        .def("free_slot", &cuda_channelizer::free_slot,
+             py::arg("slot"),
+             "Release a previously-allocated slot back to the free pool.");
 }

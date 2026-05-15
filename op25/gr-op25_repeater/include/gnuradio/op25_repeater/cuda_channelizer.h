@@ -60,6 +60,19 @@ public:
      * Thread-safe.
      */
     virtual void clear_channel(int slot) = 0;
+
+    /*!
+     * \brief Allocate the next free slot and assign it to center_freq_hz.
+     *
+     * \returns Allocated slot index (0 … max_channels-1), or -1 if all slots
+     *          are in use.  Thread-safe.
+     */
+    virtual int alloc_slot(float center_freq_hz) = 0;
+
+    /*!
+     * \brief Release a previously-allocated slot.  Thread-safe.
+     */
+    virtual void free_slot(int slot) = 0;
 };
 
 } // namespace op25_repeater
