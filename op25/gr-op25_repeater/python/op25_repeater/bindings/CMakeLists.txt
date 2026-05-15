@@ -29,6 +29,7 @@ include(GrPybind)
 ########################################################################
 
 list(APPEND op25_repeater_python_files
+    cuda_channelizer_python.cc
     ambe_encoder_sb_python.cc
     analog_udp_python.cc
     costas_loop_cc_python.cc

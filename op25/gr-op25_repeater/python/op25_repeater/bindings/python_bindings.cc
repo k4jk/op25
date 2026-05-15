@@ -21,6 +21,7 @@ namespace py = pybind11;
 // Please do not delete
 /**************************************/
 // BINDING_FUNCTION_PROTOTYPES(
+    void bind_cuda_channelizer(py::module& m);
     void bind_ambe_encoder_sb(py::module& m);
     void bind_analog_udp(py::module& m);
     void bind_costas_loop_cc(py::module& m);
@@ -62,6 +63,7 @@ PYBIND11_MODULE(op25_repeater_python, m)
     // Please do not delete
     /**************************************/
     // BINDING_FUNCTION_CALLS(
+        bind_cuda_channelizer(m);
         bind_ambe_encoder_sb(m);
         bind_analog_udp(m);
         bind_costas_loop_cc(m);

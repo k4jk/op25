@@ -71,6 +71,28 @@ list(APPEND op25_repeater_sources
 
 add_subdirectory(imbe_vocoder)
 
+########################################################################
+# Optional CUDA-accelerated wideband channelizer
+########################################################################
+option(ENABLE_CUDA "Enable CUDA-accelerated polyphase channelizer" OFF)
+if(ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    list(APPEND op25_repeater_sources
+        cuda_channelizer_impl.cc           # GR block wrapper (C++, compiled by g++)
+        cuda/proto_fir.cc                  # filter design utilities (C++)
+        cuda/channelizer.cu                # stage-1 polyphase FIR + FFT
+        cuda/fir_filter.cu                 # stage-2 per-channel FIR decimation
+        cuda/fm_demod.cu                   # FM discriminator
+        cuda/symbol_recovery.cu            # M&M clock recovery + C4FM slicer
+    )
+    add_definitions(-DHAVE_CUDA)
+    message(STATUS "CUDA channelizer enabled (toolkit: ${CUDAToolkit_VERSION})")
+else()
+    message(STATUS "CUDA channelizer disabled — use -DENABLE_CUDA=ON to enable")
+endif()
+
 option(P25_ONLY "Restrict decode to P25 frames only" OFF)
 if (P25_ONLY)
   message(STATUS "Decode P25 frame types only")
@@ -109,6 +131,9 @@ endif(NOT op25_repeater_sources)
 
 add_library(gnuradio-op25_repeater SHARED ${op25_repeater_sources})
 target_link_libraries(gnuradio-op25_repeater PRIVATE imbe_vocoder gnuradio::gnuradio-runtime gnuradio::gnuradio-filter)
+if(ENABLE_CUDA)
+    target_link_libraries(gnuradio-op25_repeater PRIVATE CUDA::cufft)
+endif()
 target_include_directories(gnuradio-op25_repeater
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../lib>

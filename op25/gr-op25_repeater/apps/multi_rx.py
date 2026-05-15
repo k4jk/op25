@@ -567,6 +567,10 @@ class rx_block (gr.top_block):
         self.trunking = None
         self.du_watcher = None
         self.rx_q = gr.msg_queue(100)
+        self._cuda_chan = None         # cuda_channelizer block (one per SDR device)
+        self._cuda_dev  = None         # device whose IQ feeds _cuda_chan
+        self._cuda_slots = {}          # msgq_id → output-port slot index
+        self._cuda_next_slot = 0
         self.ui_in_q = gr.msg_queue(100)
         self.ui_out_q = gr.msg_queue(100)
         self.ui_timeout = 5.0
@@ -588,6 +592,18 @@ class rx_block (gr.top_block):
             self.configure_trunking(self.config['trunking']) # add default module for P25 Conventional terminal support
 
         self.configure_devices(config['devices'])
+        if 'channelizer' in config and len(self.devices) > 0:
+            try:
+                ch_cfg = config['channelizer']
+                self._cuda_dev  = self.devices[0]
+                self._cuda_chan = op25_repeater.cuda_channelizer(
+                    ch_cfg.get('config_path', 'channelizer.json'),
+                    ch_cfg.get('max_channels', 20), verbosity)
+                self.connect(self._cuda_dev.src, self._cuda_chan)
+                sys.stderr.write('CUDA channelizer enabled\n')
+            except Exception as e:
+                sys.stderr.write('CUDA channelizer unavailable: %s\n' % e)
+                self._cuda_chan = None
         self.configure_channels(config['channels'])
 
         if self.trunking is not None: # post-initialization after channels and devices created
@@ -772,6 +788,13 @@ class rx_block (gr.top_block):
                 self.connect(chan.raw_file, chan.throttle)
                 self.connect(chan.throttle, chan.decoder)
                 self.set_interactive(False) # this is non-interactive 'replay' session 
+            elif self._cuda_chan is not None and dev == self._cuda_dev:
+                slot = self._cuda_next_slot
+                self._cuda_next_slot += 1
+                self._cuda_slots[msgq_id] = slot
+                if 'frequency' in cfg:
+                    self._cuda_chan.set_channel(slot, float(cfg['frequency']))
+                self.connect((self._cuda_chan, slot), chan.decoder)
             else:
                 self.connect(dev.src, chan.demod, chan.decoder)
                 if ("raw_output" in cfg) and (cfg['raw_output'] != ""):
@@ -789,6 +812,16 @@ class rx_block (gr.top_block):
             if self.verbosity:
                 sys.stderr.write("%s No %s channel available for tuning\n" % (log_ts.get(), params['tuner']))
             return False
+
+        # CUDA path: remap the polyphase bin for this tuner's slot instead of
+        # physically retuning the SDR.
+        if self._cuda_chan is not None and tuner in self._cuda_slots:
+            slot = self._cuda_slots[tuner]
+            freq = params.get('freq', 0)
+            if freq:
+                self._cuda_chan.set_channel(slot, float(freq))
+            else:
+                self._cuda_chan.clear_channel(slot)
 
         chan = self.channels[tuner]
         if 'sigtype' in params and params['sigtype'] == "P25": # P25 specific config
