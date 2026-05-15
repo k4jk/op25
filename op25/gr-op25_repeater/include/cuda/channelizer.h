@@ -60,14 +60,26 @@ struct ChannelizerState {
     std::mutex                  channel_mutex;
 
 #ifdef HAVE_CUDA
+    // ---- Stage 1: polyphase channelizer ----
     // d_input is a padded buffer: [(K-1)*M + input_len] complex samples.
     // The first (K-1)*M samples are the FIR history from the previous block;
     // the next input_len samples are overwritten with new IQ on each call.
     cufftComplex*   d_input;          // padded IQ buffer on GPU
-    int             input_len;        // new samples per processing block (must be multiple of M)
+    int             input_len;        // new samples per block (multiple of M); L = input_len/M
     float*          d_proto_filter;   // prototype FIR coefficients on GPU (reference copy)
-    float*          d_poly_phases;    // polyphase matrix [num_phases * taps_per_phase], row-major
-    cufftComplex*   d_phase_out;      // intermediate: [input_len] phase filter outputs (L*M)
-    cufftHandle     fft_plan;         // cuFFT M-point FFT, batch size = input_len / num_phases
+    float*          d_poly_phases;    // polyphase matrix [M * K], row-major (phase × tap)
+    cufftComplex*   d_phase_out;      // intermediate + stage-1 output: [L * M], step-major
+    cufftHandle     fft_plan;         // cuFFT M-point forward FFT, batch = L
+
+    // ---- Stage 2: per-channel decimating FIR ----
+    // Padded input: [(N2-1 + L) * M] step-major.  First (N2-1)*M are history.
+    float*          d_s2_coeff;       // stage-2 FIR coefficients [s2_filter_len]
+    int             s2_filter_len;    // N2 (number of stage-2 FIR taps)
+    cufftComplex*   d_s2_padded;      // padded stage-1 output for all M channels
+    cufftComplex*   d_s2_output;      // decimated output [(L/D) * M], step-major
+
+    // ---- FM demodulator ----
+    cufftComplex*   d_fm_prev;        // previous sample per channel [M] for ∆θ discriminator
+    float*          d_fm_output;      // demodulated frequency [(L/D) * M], step-major (radians/sample)
 #endif
 };
