@@ -21,3 +21,14 @@ bool fm_demod_alloc(ChannelizerState& state);
 void fm_demod_process(ChannelizerState& state, int out_steps);
 
 void fm_demod_free(ChannelizerState& state);
+
+// C4FM matched receive filter — applied to d_fm_output before Gardner clock recovery.
+// 19-tap symmetric FIR (op25_c4fm_mod.transfer_function_rx, 12500 Hz / 4800 baud).
+// Reduces ISI and opens the eye for inner symbols.
+//
+// c4fm_filter_alloc: allocates d_c4fm_history [18*M] and d_fm_filtered [out_steps*M].
+// c4fm_filter_process: runs the FIR kernel, then updates d_c4fm_history for next block.
+// c4fm_filter_free: frees both buffers.
+bool c4fm_filter_alloc(ChannelizerState& state);
+void c4fm_filter_process(ChannelizerState& state, int out_steps);
+void c4fm_filter_free(ChannelizerState& state);

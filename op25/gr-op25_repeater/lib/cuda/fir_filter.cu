@@ -80,8 +80,11 @@ __global__ void s2_decimate_kernel(
     cufftComplex*                    d_output,   // [(L/D)*M], step-major
     int M, int D, int N2)
 {
-    const int chan     = static_cast<int>(threadIdx.x);
-    const int out_step = static_cast<int>(blockIdx.x);
+    // 2D grid: blockIdx.x = channel group, blockIdx.y = output step.
+    const int chan     = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+    const int out_step = static_cast<int>(blockIdx.y);
+    if (chan >= M) return;
 
     float re = 0.0f, im = 0.0f;
     // base index in padded array for this (out_step, tap=0): (N2-1 + out_step*D) * M + chan
@@ -154,9 +157,13 @@ int s2_filter_process(ChannelizerState& state, const cufftComplex* d_s1_output)
                static_cast<size_t>(L) * M * sizeof(cufftComplex),
                cudaMemcpyDeviceToDevice);
 
-    // Decimate: one block per output step, M threads per block
+    // Decimate: 2D grid supports M > 1024 threads/block.
+    // Grid: (ceil(M/512), out_steps)   Block: (512, 1)
     int out_steps = L / D;
-    s2_decimate_kernel<<<out_steps, M>>>(
+    constexpr int CHAN_W = 512;
+    dim3 s2_block(CHAN_W);
+    dim3 s2_grid((M + CHAN_W - 1) / CHAN_W, out_steps);
+    s2_decimate_kernel<<<s2_grid, s2_block>>>(
         state.d_s2_padded,
         state.d_s2_coeff,
         state.d_s2_output,

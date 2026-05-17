@@ -2332,7 +2332,12 @@ class p25_receiver(object):
                            'nac':     nac,
                            'wacn':    wacn,
                            'sysid':   sysid}
-            self.frequency_set(tune_params)
+            if not self.frequency_set(tune_params):
+                # Tune was blocked (e.g. CUDA Phase 2 workaround).  CC was
+                # already released above, so mark idle so check_cc_assignments
+                # can reassign us — without disabling the frame_assembler.
+                self.tuner_idle = True
+                return
             self.tuned_frequency = freq
 
         self.vc_retries = 0

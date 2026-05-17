@@ -45,7 +45,10 @@ public:
     // ---- Channel control (all thread-safe) ---------------------------------
 
     // Assign a polyphase bin to output port [slot].
-    void set_channel(int slot, float center_freq_hz) override;
+    // tdma_slot: 0 or 1 for Phase 2 TDMA slots (ignored for Phase 1).
+    // p25_mode:  1=Phase1 C4FM, 2=Phase2 H-DQPSK TDMA.
+    void set_channel(int slot, float center_freq_hz,
+                     int tdma_slot = 0, int p25_mode = 1) override;
 
     // Deactivate output port [slot].
     void clear_channel(int slot) override;
@@ -64,9 +67,11 @@ private:
     int               d_M;          // polyphase bin count (= num_phases = FFT size)
     int               d_input_len;  // complex samples per GPU batch
 
-    std::vector<int>  d_slot_to_bin;     // [max_channels]: bin index, or -1 inactive
-    std::vector<bool> d_slot_allocated;  // [max_channels]: true if alloc_slot owns it
-    std::mutex        d_slot_mutex;
+    std::vector<int>    d_slot_to_bin;    // [max_channels]: bin index, or -1 inactive
+    std::vector<int8_t> d_slot_to_mode;  // [max_channels]: 1=Phase1, 2=Phase2
+    std::vector<int8_t> d_bin_to_mode;   // [M]: per-bin mode, set when bin is assigned
+    std::vector<bool>   d_slot_allocated; // [max_channels]: true if alloc_slot owns it
+    std::mutex          d_slot_mutex;
 
     // Per-slot recovered dibit queues (drained to GR output buffers)
     std::vector<std::deque<uint8_t>> d_out_queues;
@@ -74,6 +79,11 @@ private:
     // CPU staging buffers (reused each batch)
     std::vector<int32_t> d_h_counts;
     std::vector<int8_t>  d_h_dibits;
+
+    // Internal IQ accumulation — collects samples across general_work() calls
+    // until a full d_input_len batch is ready for the GPU.
+    std::vector<gr_complex> d_accum_buf;
+    size_t                  d_accum_fill{0};
 
     // ---- UDP control listener ----------------------------------------------
     int             d_ctrl_port;     // listen port
@@ -99,8 +109,13 @@ private:
     std::vector<cudaStream_t> d_slot_streams;  // [max_channels]
     cudaStream_t              d_pipeline_stream{nullptr};
 
+    // Per-bin M&M reset: set true in set_channel(), consumed in run_gpu_batch()
+    // before mm_process() launches. Protected by d_slot_mutex.
+    std::vector<bool> d_bin_reset_pending;
+
     bool alloc_pipeline(const std::string& config_path);
     void run_gpu_batch(const void* cpu_iq_buf);
+    void apply_pending_mm_resets();   // called from run_gpu_batch(), default stream
     void free_pipeline();
 
     // Frequency → polyphase bin (wraps into [0, M))

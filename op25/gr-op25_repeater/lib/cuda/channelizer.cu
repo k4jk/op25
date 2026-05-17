@@ -58,8 +58,12 @@ __global__ void poly_filter_kernel(
     cufftComplex*                    d_phase_out,
     int M, int K)
 {
-    const int phase = static_cast<int>(threadIdx.x);
-    const int step  = static_cast<int>(blockIdx.x);
+    // 2D grid: blockIdx.x = channel group, blockIdx.y = time step.
+    // Supports M > 1024 (CUDA max threads/block).
+    const int phase = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                    + static_cast<int>(threadIdx.x);
+    const int step  = static_cast<int>(blockIdx.y);
+    if (phase >= M) return;
 
     float re = 0.0f, im = 0.0f;
     int   base = (K - 1 + step) * M + phase;
@@ -174,8 +178,12 @@ int channelizer_process(ChannelizerState& state,
                static_cast<size_t>(state.input_len) * sizeof(cufftComplex),
                cudaMemcpyDeviceToDevice);
 
-    // Polyphase FIR filter: one block per output step, M threads per block
-    poly_filter_kernel<<<L, M>>>(
+    // Polyphase FIR filter: 2D grid supports M > 1024 threads/block.
+    // Grid: (ceil(M/512), L)   Block: (512, 1)
+    constexpr int CHAN_W = 512;
+    dim3 pf_block(CHAN_W);
+    dim3 pf_grid((M + CHAN_W - 1) / CHAN_W, L);
+    poly_filter_kernel<<<pf_grid, pf_block>>>(
         state.d_input,
         state.d_poly_phases,
         state.d_phase_out,

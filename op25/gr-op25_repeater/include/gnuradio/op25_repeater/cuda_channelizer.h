@@ -50,8 +50,12 @@ public:
      * Maps output port \p slot to the polyphase bin closest to
      * \p center_freq_hz.  Dibits for that bin will appear on output port
      * \p slot.  Thread-safe.
+     *
+     * \param tdma_slot  TDMA slot index (0 or 1) for Phase 2 channels; ignored for Phase 1.
+     * \param p25_mode   1 = Phase 1 C4FM (default), 2 = Phase 2 H-DQPSK TDMA.
      */
-    virtual void set_channel(int slot, float center_freq_hz) = 0;
+    virtual void set_channel(int slot, float center_freq_hz,
+                             int tdma_slot = 0, int p25_mode = 1) = 0;
 
     /*!
      * \brief Deactivate a channel slot.

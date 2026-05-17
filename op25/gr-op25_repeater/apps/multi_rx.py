@@ -567,10 +567,13 @@ class rx_block (gr.top_block):
         self.trunking = None
         self.du_watcher = None
         self.rx_q = gr.msg_queue(100)
-        self._cuda_chan = None         # cuda_channelizer block (one per SDR device)
-        self._cuda_dev  = None         # device whose IQ feeds _cuda_chan
-        self._cuda_slots = {}          # msgq_id → output-port slot index
-        self._cuda_next_slot = 0
+        self._cuda_chans = []          # cuda_channelizer blocks (one per CUDA-enabled device)
+        self._cuda_devs = []           # devices feeding each channelizer (parallel to _cuda_chans)
+        self._cuda_centers = []        # center freqs (Hz) for frequency-to-channelizer routing
+        self._cuda_bws = []            # ADC bandwidths (Hz) for routing (= sample_rate per device)
+        self._cuda_max_slots = []      # max output slots per channelizer
+        self._cuda_next_slots = []     # next free local slot index per channelizer
+        self._cuda_slots = {}          # msgq_id → (chan_idx, local_slot)
         self.ui_in_q = gr.msg_queue(100)
         self.ui_out_q = gr.msg_queue(100)
         self.ui_timeout = 5.0
@@ -593,18 +596,73 @@ class rx_block (gr.top_block):
 
         self.configure_devices(config['devices'])
         if 'channelizer' in config and len(self.devices) > 0:
+            ch_cfg = config['channelizer']
+            config_path = ch_cfg.get('config_path', 'channelizer.json')
+            default_max_channels = int(ch_cfg.get('max_channels', 20))
+            import tempfile
+
+            # Load base channelizer JSON for shared params (taps_per_phase, channel_bw_hz, etc.)
             try:
-                ch_cfg = config['channelizer']
-                self._cuda_dev  = self.devices[0]
-                self._cuda_chan = op25_repeater.cuda_channelizer(
-                    ch_cfg.get('config_path', 'channelizer.json'),
-                    ch_cfg.get('max_channels', 20), verbosity)
-                self.connect(self._cuda_dev.src, self._cuda_chan)
-                sys.stderr.write('CUDA channelizer enabled\n')
+                with open(config_path) as _f:
+                    _base = json.load(_f)
+                _base_inner = dict(_base.get('channelizer', _base))
             except Exception as e:
-                sys.stderr.write('CUDA channelizer unavailable: %s\n' % e)
-                self._cuda_chan = None
+                sys.stderr.write('cuda_channelizer: cannot read %s: %s\n' % (config_path, e))
+                _base_inner = {}
+
+            base_ctrl_port   = int(_base_inner.get('control_port', 0))
+            base_status_port = int(_base_inner.get('status_port', 0))
+
+            for _dev_idx, (dev, dev_raw) in enumerate(zip(self.devices, config['devices'])):
+                if not dev_raw.get('cuda', True):   # opt out with "cuda": false in device config
+                    continue
+                try:
+                    max_channels  = int(dev_raw.get('channelizer_max_channels', default_max_channels))
+                    actual_center = int(dev.frequency + dev.offset)
+                    actual_rate   = int(dev.sample_rate)
+
+                    # Build per-device config: inherit base, override device-specific params.
+                    _jcfg_inner = dict(_base_inner)
+                    _jcfg_inner['center_freq_hz'] = actual_center
+                    _jcfg_inner['sample_rate_hz'] = actual_rate
+                    _jcfg_inner['max_channels']   = max_channels
+                    # Give each device unique control/status ports to avoid bind conflicts.
+                    if base_ctrl_port:
+                        _jcfg_inner['control_port']  = base_ctrl_port   + _dev_idx * 2
+                        _jcfg_inner['status_port']   = base_status_port + _dev_idx * 2
+
+                    _tf = tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.json',
+                        dir=os.path.dirname(os.path.abspath(config_path)),
+                        delete=False)
+                    json.dump({'channelizer': _jcfg_inner}, _tf)
+                    _tf.close()
+                    tmp_path = _tf.name
+
+                    chan_block = op25_repeater.cuda_channelizer(tmp_path, max_channels, verbosity)
+                    os.unlink(tmp_path)
+                    self.connect(dev.src, chan_block)
+
+                    self._cuda_chans.append(chan_block)
+                    self._cuda_devs.append(dev)
+                    self._cuda_centers.append(float(actual_center))
+                    self._cuda_bws.append(float(actual_rate))
+                    self._cuda_max_slots.append(max_channels)
+                    self._cuda_next_slots.append(0)
+                    sys.stderr.write('CUDA channelizer [%d] enabled: device=%s center=%d Hz '
+                                     'rate=%d sps slots=%d\n'
+                                     % (len(self._cuda_chans) - 1, dev.name,
+                                        actual_center, actual_rate, max_channels))
+                except Exception as e:
+                    sys.stderr.write('CUDA channelizer unavailable for device %s: %s\n'
+                                     % (dev.name, e))
         self.configure_channels(config['channels'])
+
+        # GR requires every output port of cuda_channelizer to be connected.
+        # Pad any slots that configure_channels() didn't use with null_sinks.
+        for _chan_block, _next, _maxs in zip(self._cuda_chans, self._cuda_next_slots, self._cuda_max_slots):
+            for _s in range(_next, _maxs):
+                self.connect((_chan_block, _s), blocks.null_sink(gr.sizeof_char))
 
         if self.trunking is not None: # post-initialization after channels and devices created
             self.trunk_rx.post_init()
@@ -766,6 +824,17 @@ class rx_block (gr.top_block):
                         break
                 if dev == None:
                     continue    
+            # Pre-check CUDA slot availability before creating the channel object.
+            # (chan.decoder must be connected before GR starts; we can't continue after appending.)
+            _use_raw_input = ("raw_input" in cfg) and (cfg['raw_input'] != "")
+            _cuda_cidx = None
+            if dev in self._cuda_devs and not _use_raw_input:
+                _cuda_cidx = self._cuda_devs.index(dev)
+                if self._cuda_next_slots[_cuda_cidx] >= self._cuda_max_slots[_cuda_cidx]:
+                    sys.stderr.write("* * * No free CUDA slots on device %s for channel '%s' - ignoring!\n"
+                                     % (dev.name, cfg.get('name', '?')))
+                    continue
+
             meta_s, meta_q = None, None
             if self.metadata is not None and 'meta_stream_name' in cfg and cfg['meta_stream_name'] != "" and cfg['meta_stream_name'] in self.meta_streams:
                 meta_s, meta_q = self.meta_streams[cfg['meta_stream_name']]
@@ -778,7 +847,7 @@ class rx_block (gr.top_block):
                 msgq_id = -1 - len(self.channels)
                 chan = channel(cfg, dev, self.verbosity, msgq_id, self.rx_q, self)
                 self.channels.append(chan)
-            if ("raw_input" in cfg) and (cfg['raw_input'] != ""):
+            if _use_raw_input:
                 sys.stderr.write("%s Reading raw symbols from file: %s\n" % (log_ts.get(), cfg['raw_input']))
                 chan.raw_file = blocks.file_source(gr.sizeof_char, str(cfg['raw_input']), False)
                 if ("raw_seek" in cfg) and (cfg['raw_seek'] != 0):
@@ -787,14 +856,15 @@ class rx_block (gr.top_block):
                 chan.throttle.set_max_noutput_items(int(chan.symbol_rate/50));
                 self.connect(chan.raw_file, chan.throttle)
                 self.connect(chan.throttle, chan.decoder)
-                self.set_interactive(False) # this is non-interactive 'replay' session 
-            elif self._cuda_chan is not None and dev == self._cuda_dev:
-                slot = self._cuda_next_slot
-                self._cuda_next_slot += 1
-                self._cuda_slots[msgq_id] = slot
+                self.set_interactive(False) # this is non-interactive 'replay' session
+            elif _cuda_cidx is not None:
+                _lslot = self._cuda_next_slots[_cuda_cidx]
+                self._cuda_next_slots[_cuda_cidx] += 1
+                self._cuda_slots[msgq_id] = (_cuda_cidx, _lslot)
+                _chan_block = self._cuda_chans[_cuda_cidx]
                 if 'frequency' in cfg:
-                    self._cuda_chan.set_channel(slot, float(cfg['frequency']))
-                self.connect((self._cuda_chan, slot), chan.decoder)
+                    _chan_block.set_channel(_lslot, float(cfg['frequency']))
+                self.connect((_chan_block, _lslot), chan.decoder)
             else:
                 self.connect(dev.src, chan.demod, chan.decoder)
                 if ("raw_output" in cfg) and (cfg['raw_output'] != ""):
@@ -813,15 +883,20 @@ class rx_block (gr.top_block):
                 sys.stderr.write("%s No %s channel available for tuning\n" % (log_ts.get(), params['tuner']))
             return False
 
-        # CUDA path: remap the polyphase bin for this tuner's slot instead of
-        # physically retuning the SDR.
-        if self._cuda_chan is not None and tuner in self._cuda_slots:
-            slot = self._cuda_slots[tuner]
+        # CUDA path: remap the polyphase bin for this tuner's slot.
+        # Phase 2 H-DQPSK channels are handled via complex Gardner in the GPU kernel;
+        # pass the TDMA slot and mode so the kernel uses the correct demod path.
+        if tuner in self._cuda_slots:
+            _cidx, _lslot = self._cuda_slots[tuner]
+            _chan_block = self._cuda_chans[_cidx]
             freq = params.get('freq', 0)
+            tdma = params.get('tdma')
+            p25_mode = 2 if (tdma is not None) else 1
+            tdma_slot = int(tdma) if (tdma is not None) else 0
             if freq:
-                self._cuda_chan.set_channel(slot, float(freq))
+                _chan_block.set_channel(_lslot, float(freq), tdma_slot, p25_mode)
             else:
-                self._cuda_chan.clear_channel(slot)
+                _chan_block.clear_channel(_lslot)
 
         chan = self.channels[tuner]
         if 'sigtype' in params and params['sigtype'] == "P25": # P25 specific config

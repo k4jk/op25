@@ -61,6 +61,7 @@ cuda_channelizer_impl::cuda_channelizer_impl(const std::string& config_path,
       d_M(0),
       d_input_len(0),
       d_slot_to_bin(max_channels, -1),
+      d_slot_to_mode(max_channels, 1),
       d_slot_allocated(max_channels, false),
       d_out_queues(max_channels),
       d_ctrl_port(0),
@@ -76,6 +77,7 @@ cuda_channelizer_impl::cuda_channelizer_impl(const std::string& config_path,
 
     d_h_counts.resize(d_M);
     d_h_dibits.resize(static_cast<size_t>(MM_MAX_SYM) * d_M);
+    d_accum_buf.resize(d_input_len);
 
     set_tag_propagation_policy(TPP_DONT);
 
@@ -101,14 +103,15 @@ cuda_channelizer_impl::~cuda_channelizer_impl()
 // GR scheduling
 // ---------------------------------------------------------------------------
 
-void cuda_channelizer_impl::forecast(int noutput_items,
+void cuda_channelizer_impl::forecast(int /*noutput_items*/,
                                      gr_vector_int& ninput_items_required)
 {
-    bool has_queued = false;
-    for (const auto& q : d_out_queues)
-        if (!q.empty()) { has_queued = true; break; }
-
-    ninput_items_required[0] = has_queued ? 1 : d_input_len;
+    // Always accept whatever GR delivers.  Accumulation to d_input_len happens
+    // inside general_work(), so we never need to ask for more than 1 item here.
+    // Asking for d_input_len (up to 3.2 M at M=1600) exceeded the GR ring-buffer
+    // size and caused a busy-loop: general_work was called repeatedly with
+    // insufficient data, consuming nothing and burning a full CPU core.
+    ninput_items_required[0] = 1;
 }
 
 int cuda_channelizer_impl::general_work(int noutput_items,
@@ -121,24 +124,34 @@ int cuda_channelizer_impl::general_work(int noutput_items,
     for (int i = 0; i < d_max_channels; i++) produce(i, 0);
     return WORK_CALLED_PRODUCE;
 #else
-    bool all_empty = true;
-    for (const auto& q : d_out_queues)
-        if (!q.empty()) { all_empty = false; break; }
+    // ── Accumulate incoming IQ samples ──────────────────────────────────────
+    // GR delivers whatever fits in its ring buffer (~32 K items typically).
+    // We copy into d_accum_buf and fire a GPU batch once d_input_len is full.
+    const auto* in   = static_cast<const gr_complex*>(input_items[0]);
+    int         n_in = ninput_items[0];
+    int         consumed = 0;
 
-    int consumed = 0;
-    if (all_empty) {
-        if (ninput_items[0] < d_input_len) {
-            consume_each(0);
-            for (int i = 0; i < d_max_channels; i++) produce(i, 0);
-            return WORK_CALLED_PRODUCE;
+    while (consumed < n_in) {
+        size_t space = static_cast<size_t>(d_input_len) - d_accum_fill;
+        size_t take  = std::min(space, static_cast<size_t>(n_in - consumed));
+        std::memcpy(d_accum_buf.data() + d_accum_fill, in + consumed,
+                    take * sizeof(gr_complex));
+        d_accum_fill += take;
+        consumed     += static_cast<int>(take);
+
+        if (static_cast<int>(d_accum_fill) >= d_input_len) {
+            run_gpu_batch(d_accum_buf.data());
+            d_accum_fill = 0;
         }
-        run_gpu_batch(input_items[0]);
-        consumed = d_input_len;
     }
 
+    // ── Drain per-slot queues to GR output buffers ───────────────────────────
+    // Hold the mutex so set_channel()/clear_channel() can't clear a deque
+    // while we are iterating it.
+    std::lock_guard<std::mutex> lk(d_slot_mutex);
     for (int slot = 0; slot < d_max_channels; slot++) {
-        auto& q = d_out_queues[slot];
-        int n = std::min(static_cast<int>(q.size()), noutput_items);
+        auto&    q   = d_out_queues[slot];
+        int      n   = std::min(static_cast<int>(q.size()), noutput_items);
         uint8_t* out = static_cast<uint8_t*>(output_items[slot]);
         for (int i = 0; i < n; i++) { out[i] = q.front(); q.pop_front(); }
         produce(slot, n);
@@ -153,17 +166,30 @@ int cuda_channelizer_impl::general_work(int noutput_items,
 // Channel control — public API (all thread-safe)
 // ---------------------------------------------------------------------------
 
-void cuda_channelizer_impl::set_channel(int slot, float center_freq_hz)
+void cuda_channelizer_impl::set_channel(int slot, float center_freq_hz,
+                                        int tdma_slot, int p25_mode)
 {
     if (slot < 0 || slot >= d_max_channels) return;
 #ifdef HAVE_CUDA
     int bin = freq_to_bin(center_freq_hz);
+    const int8_t mode = static_cast<int8_t>((p25_mode == 2) ? 2 : 1);
     if (d_debug)
-        fprintf(stderr, "cuda_channelizer: slot %d → bin %d  (%.0f Hz)\n",
-                slot, bin, (double)center_freq_hz);
+        fprintf(stderr, "cuda_channelizer: slot %d → bin %d  (%.0f Hz)  mode=%d tdma=%d\n",
+                slot, bin, (double)center_freq_hz, (int)mode, tdma_slot);
     std::lock_guard<std::mutex> lk(d_slot_mutex);
-    d_slot_to_bin[slot] = bin;
-    d_out_queues[slot].clear();
+    const bool bin_changed  = (bin  != d_slot_to_bin[slot]);
+    const bool mode_changed = (mode != d_slot_to_mode[slot]);
+    d_slot_to_bin[slot]  = bin;
+    d_slot_to_mode[slot] = mode;
+    d_bin_to_mode[bin]   = mode;
+    if (bin_changed || mode_changed) {
+        // Only discard buffered dibits when the channel frequency or mode changes.
+        // Re-confirming the same slot (repeated grants) must NOT clear the queue —
+        // doing so drops mid-LDU dibits, shifts d_rx_count in rx_sync, and causes
+        // "resync at wrong time" every time the trunking controller rebroadcasts a grant.
+        d_out_queues[slot].clear();
+        d_bin_reset_pending[bin] = true;
+    }
 #endif
 }
 
@@ -280,9 +306,11 @@ void cuda_channelizer_impl::handle_command(const std::string& json_in,
         reply["cmd"] = cmd;
 
         if (cmd == "add_channel") {
-            int   slot    = j.value("slot",    -1);
-            float freq_hz = j.value("freq_hz", 0.0f);
-            set_channel(slot, freq_hz);
+            int   slot     = j.value("slot",      -1);
+            float freq_hz  = j.value("freq_hz",   0.0f);
+            int   tdma_sl  = j.value("tdma_slot", 0);
+            int   p25_mode = j.value("p25_mode",  1);
+            set_channel(slot, freq_hz, tdma_sl, p25_mode);
             reply["slot"] = slot;
             reply["ok"]   = true;
 
@@ -346,8 +374,9 @@ void cuda_channelizer_impl::handle_command(const std::string& json_in,
 
 #ifdef HAVE_CUDA
 
-static constexpr int S2_FILTER_LEN = 128;
-static constexpr int DEFAULT_L     = 2000;
+static constexpr int S2_FILTER_LEN      = 128;
+static constexpr int S2_OUT_STEPS_TARGET = 80; // desired stage-2 output steps per GPU batch
+                                               // (~30 P25 symbols/batch at 4800 baud, ≈6.4 ms)
 
 int cuda_channelizer_impl::freq_to_bin(float freq_hz) const
 {
@@ -388,7 +417,17 @@ bool cuda_channelizer_impl::alloc_pipeline(const std::string& config_path)
     }
 
     d_M                   = cfg.num_phases;
-    d_input_len           = DEFAULT_L * d_M;
+    d_bin_reset_pending.assign(d_M, false);
+    d_bin_to_mode.assign(d_M, 1);  // default all bins to Phase 1
+    {
+        // L must be divisible by D (stage2_decimation).  Round OUT_STEPS_TARGET
+        // up to the next multiple of D, then multiply by M to get total input samples.
+        // L = stage-1 steps per batch = S2_OUT_STEPS_TARGET * D, which is
+        // always divisible by D by construction.
+        const int D   = cfg.stage2_decimation;
+        const int L   = S2_OUT_STEPS_TARGET * D;   // e.g. 80*25=2000 for 20MHz/12.5kHz
+        d_input_len   = L * d_M;                  // e.g. 2000*64=128000 samples
+    }
     d_sdr_center_freq_hz  = cfg.sdr_center_freq_hz;
     d_channel_bw_hz       = cfg.channel_bw_hz;
     d_ctrl_port           = cfg.control_port;
@@ -412,6 +451,7 @@ bool cuda_channelizer_impl::alloc_pipeline(const std::string& config_path)
     if (!channelizer_alloc(d_state, proto, poly, d_input_len)) return false;
     if (!s2_filter_alloc(d_state, s2_h))                       return false;
     if (!fm_demod_alloc(d_state))                              return false;
+    if (!c4fm_filter_alloc(d_state))                           return false;
     if (!mm_alloc(d_state))                                    return false;
 
     // Initialise M&M mu to sps/2 so first strobe lands at symbol centre
@@ -446,6 +486,8 @@ void cuda_channelizer_impl::run_gpu_batch(const void* cpu_iq_buf)
     channelizer_process(d_state, d_gpu_in, d_s1_scratch);
     int out_steps = s2_filter_process(d_state, d_s1_scratch);
     fm_demod_process(d_state, out_steps);
+    c4fm_filter_process(d_state, out_steps);
+    apply_pending_mm_resets();
     mm_process(d_state, out_steps);
 
     // Download results using the pipeline stream
@@ -469,9 +511,65 @@ void cuda_channelizer_impl::run_gpu_batch(const void* cpu_iq_buf)
     }
 }
 
+// Reset M&M timing state for any bins flagged by set_channel() since the last batch.
+// Must be called from the GR work thread (default CUDA stream) after fm_demod and
+// before mm_process, so the reset is serialized with both kernels.
+void cuda_channelizer_impl::apply_pending_mm_resets()
+{
+    const float   zero          = 0.0f;
+    const int32_t fast_ctr_init = MM_FAST_SYMBOLS;
+
+    // Phase 1 nominal sps: channel_bw / 4800 baud
+    // Phase 2 nominal sps: channel_bw / 6000 baud
+    const float sps_p1 = d_channel_bw_hz / 4800.0f;
+    const float sps_p2 = d_channel_bw_hz / 6000.0f;
+
+    const cufftComplex zero_c = {0.0f, 0.0f};
+
+    std::lock_guard<std::mutex> lk(d_slot_mutex);
+    for (int k = 0; k < d_M; k++) {
+        if (!d_bin_reset_pending[k]) continue;
+
+        const int8_t mode    = d_bin_to_mode[k];
+        const float sps_nom  = (mode == 2) ? sps_p2 : sps_p1;
+        const float sps_init = sps_nom / 2.0f;  // mu = sps/2: first strobe at symbol centre
+
+        // Write per-bin mode to GPU so the Gardner kernel uses the correct path
+        cudaMemcpy(d_state.d_channel_mode + k, &mode,         sizeof(int8_t),  cudaMemcpyHostToDevice);
+
+        cudaMemcpy(d_state.d_mm_mu        + k, &sps_init,     sizeof(float),   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_state.d_mm_omega     + k, &sps_nom,      sizeof(float),   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_state.d_mm_dc_est    + k, &zero,         sizeof(float),   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_state.d_mm_fast_ctr  + k, &fast_ctr_init, sizeof(int32_t), cudaMemcpyHostToDevice);
+
+        if (mode == 2) {
+            // Phase 2: reset complex IQ history and last decoded symbol
+            cudaMemcpy(d_state.d_p2_iq_last  + k,        &zero_c, sizeof(cufftComplex), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_p2_iq_last  + d_M + k,  &zero_c, sizeof(cufftComplex), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_p2_iq_last  + 2*d_M + k,&zero_c, sizeof(cufftComplex), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_p2_last_sym + k,         &zero_c, sizeof(cufftComplex), cudaMemcpyHostToDevice);
+        } else {
+            // Phase 1: reset real FM history and last raw symbol
+            cudaMemcpy(d_state.d_mm_fm_last     + k,           &zero, sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_mm_fm_last     + d_M + k,    &zero, sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_mm_fm_last     + 2*d_M + k,  &zero, sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_mm_last_interp + k, &zero,    sizeof(float),        cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_mm_last_dec    + k, &zero,    sizeof(float),        cudaMemcpyHostToDevice);
+            // Clear C4FM filter history so stale FM from a prior channel
+            // does not corrupt the first block's filtered output.
+            for (int h = 0; h < 18; h++)
+                cudaMemcpy(d_state.d_c4fm_history + h * d_M + k, &zero,
+                           sizeof(float), cudaMemcpyHostToDevice);
+        }
+
+        d_bin_reset_pending[k] = false;
+    }
+}
+
 void cuda_channelizer_impl::free_pipeline()
 {
     mm_free(d_state);
+    c4fm_filter_free(d_state);
     fm_demod_free(d_state);
     s2_filter_free(d_state);
     channelizer_free(d_state);

@@ -30,21 +30,15 @@ bool compute_config(ChannelizerConfig& cfg, char* error_msg)
     if (std::fabs(total_dec_f - total_dec) > 0.01f)
         return fail("sdr_sample_rate_hz / channel_bw_hz must be an integer");
 
-    // Stage 1: largest power of 2 that divides total_dec, capped at 64.
-    int stage1 = 1;
-    while (stage1 * 2 <= 64 && (total_dec % (stage1 * 2)) == 0)
-        stage1 *= 2;
-
-    int stage2 = total_dec / stage1;
-    if (stage2 < 1)
-        return fail("computed stage2_decimation < 1");
-
-    cfg.stage1_decimation     = stage1;
-    cfg.stage2_decimation     = stage2;
-    cfg.num_phases            = stage1;
-    cfg.prototype_filter_len  = stage1 * cfg.taps_per_phase;
-    cfg.stage1_output_rate_hz = cfg.sdr_sample_rate_hz / stage1;
-    cfg.stage2_output_rate_hz = cfg.stage1_output_rate_hz / stage2;
+    // Use the full total decimation as the polyphase count so that each FFT
+    // bin maps to exactly one channel_bw_hz-wide channel.  Stage 2 becomes a
+    // plain channel filter (D=1) with no further decimation.
+    cfg.stage1_decimation     = total_dec;
+    cfg.stage2_decimation     = 1;
+    cfg.num_phases            = total_dec;
+    cfg.prototype_filter_len  = total_dec * cfg.taps_per_phase;
+    cfg.stage1_output_rate_hz = cfg.channel_bw_hz;
+    cfg.stage2_output_rate_hz = cfg.channel_bw_hz;
 
     return true;
 }

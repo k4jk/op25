@@ -9,6 +9,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0) */
 /* BINDTOOL_USE_PYGCCXML(0) */
 /* BINDTOOL_HEADER_FILE(cuda_channelizer.h) */
+/* BINDTOOL_HEADER_FILE_HASH(7fb813dd40833b648ea0fd928fb0374e) */
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -31,7 +32,9 @@ void bind_cuda_channelizer(py::module& m)
 
         .def("set_channel", &cuda_channelizer::set_channel,
              py::arg("slot"), py::arg("center_freq_hz"),
-             "Map output port slot to the polyphase bin closest to center_freq_hz.")
+             py::arg("tdma_slot") = 0, py::arg("p25_mode") = 1,
+             "Map output port slot to the polyphase bin closest to center_freq_hz. "
+             "p25_mode: 1=Phase1 C4FM (default), 2=Phase2 H-DQPSK TDMA.")
 
         .def("clear_channel", &cuda_channelizer::clear_channel,
              py::arg("slot"),

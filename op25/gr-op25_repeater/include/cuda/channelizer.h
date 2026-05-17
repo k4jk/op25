@@ -43,6 +43,7 @@ struct Channel {
     int       system_id;
     uint32_t  talkgroup;
     int       tdma_slot;        // 0 or 1 for Phase 2, always 0 for Phase 1
+    int       p25_mode;         // 1=Phase1 (C4FM), 2=Phase2 (H-DQPSK TDMA)
 
 #ifdef HAVE_CUDA
     cufftComplex*  d_stage1_out;    // polyphase channelizer output buffer
@@ -82,13 +83,30 @@ struct ChannelizerState {
     cufftComplex*   d_fm_prev;        // previous sample per channel [M] for ∆θ discriminator
     float*          d_fm_output;      // demodulated frequency [(L/D) * M], step-major (radians/sample)
 
+    // ---- C4FM matched receive filter ----
+    float*          d_c4fm_history;   // cross-block FIR history [18 * M] (last 18 FM samples of prev batch)
+    float*          d_fm_filtered;    // filtered FM output [(L/D) * M], step-major (input to Gardner)
+
     // ---- Symbol timing recovery (Mueller-Müller clock recovery) ----
     float*          d_mm_mu;          // fractional timing position [M], range ≈ [-(sps-1), sps)
-    float*          d_mm_fm_last;     // last FM sample from previous block [M] (for cross-block interp)
+    float*          d_mm_fm_last;     // last 3 FM samples from previous block [3*M]: [k]=fm(-1), [M+k]=fm(-2), [2M+k]=fm(-3)
     float*          d_mm_last_interp; // previous interpolated symbol value [M] (M&M error term)
     float*          d_mm_last_dec;    // previous slicer decision [M] (M&M error term)
     float*          d_mm_symbols;     // interpolated symbol values [MM_MAX_SYM * M], step-major
     int8_t*         d_mm_dibits;      // decoded dibits 0-3 [MM_MAX_SYM * M], step-major
     int32_t*        d_mm_sym_count;   // valid symbol count per channel [M]
+    float*          d_mm_dc_est;      // IIR carrier DC estimate per channel [M]
+    float*          d_mm_omega;       // samples-per-symbol estimate per channel [M] (Gardner rate tracking)
+    int32_t*        d_mm_fast_ctr;   // fast-gain countdown per channel [M] (symbols remaining)
+
+    // ---- Phase 2 TDMA (H-DQPSK) complex Gardner timing recovery ----
+    // Phase 2 channels bypass the FM discriminator and C4FM filter.  The
+    // complex Gardner loop reads directly from d_s2_output and performs
+    // differential decoding at the symbol level (curr × conj(prev)) so that
+    // the decoded phase transitions are exactly ±π/4 or ±3π/4 regardless of
+    // carrier offset — DC removed via d_mm_dc_est (shared with Phase 1).
+    int8_t*         d_channel_mode;   // per-bin mode [M]: 1=Phase1, 2=Phase2, 0=unset
+    cufftComplex*   d_p2_iq_last;    // cross-block complex IQ history [3*M]: indices -1,-2,-3
+    cufftComplex*   d_p2_last_sym;   // previous decoded complex symbol [M] for differential decode
 #endif
 };
