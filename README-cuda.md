@@ -251,7 +251,7 @@ subtle bugs if channel list order ever changes.
         {
             "name": "BIGSYSTEM CC",
             "device": "sdr0",
-            "trunking_sysname": "BIGSYSTEM1",
+            "trunking_sysname": "BIGSYSTEM",
             "cc": true,
             "frequency": 855587500,
             "demod_type": "cqpsk"
