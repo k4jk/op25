@@ -133,6 +133,7 @@ public:
 	void set_slot_key(int mask);
 	void set_xormask(const char* p);
 	void set_nac(int nac);
+	void set_p25_mode(int mode);
 	//crypt_behavior
 	void crypt_behavior(int behavior);
 	void set_debug(int debug);
@@ -168,6 +169,7 @@ private:
 	int d_shift_reg;
 	int d_slot_mask;
 	int d_slot_key;
+	int d_p25_mode;
 	unsigned int d_unmute_until[2];
 	op25_audio& d_audio;
 	p25p1_fdma p25fdma;

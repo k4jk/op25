@@ -33,3 +33,9 @@ int channelizer_process(ChannelizerState& state,
 
 // Free all stage-1 GPU buffers and destroy the cuFFT plan.
 void channelizer_free(ChannelizerState& state);
+
+// Remove the implicit Nyquist carrier from odd-bin FFT outputs when
+// fft_oversample > 1.  Must be called on d_output (the buffer returned by
+// channelizer_process) before s2_filter_process().  No-op when fft_size ==
+// num_phases (critically sampled).
+void decarrier_process(ChannelizerState& state, cufftComplex* d_output, int L);

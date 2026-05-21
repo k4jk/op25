@@ -32,3 +32,15 @@ void fm_demod_free(ChannelizerState& state);
 bool c4fm_filter_alloc(ChannelizerState& state);
 void c4fm_filter_process(ChannelizerState& state, int out_steps);
 void c4fm_filter_free(ChannelizerState& state);
+
+// DC blocker — applied to d_fm_filtered in-place after the C4FM filter and
+// before the Gardner timing loop.  Equivalent to dc_blocker_ff in the CPU
+// cqpsk path: removes the carrier frequency offset so that Gardner's mid-sample
+// probe is zero-mean and timing jitter is not amplified by the DC bias.
+//
+// IIR: y[n] = x[n] - x[n-1] + alpha*y[n-1], alpha=0.99
+// Cutoff ≈ 20 Hz at 12500 sps; settles in ~100 samples (8 ms) after reset,
+// within the fast_ctr window.  State is zeroed on channel reset.
+bool dc_blocker_alloc(ChannelizerState& state);
+void dc_blocker_process(ChannelizerState& state, int out_steps);
+void dc_blocker_free(ChannelizerState& state);

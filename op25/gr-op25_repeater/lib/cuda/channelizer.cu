@@ -4,16 +4,18 @@
 //   1. poly_filter_kernel: for each output step s, thread k computes
 //      y_k[s] = sum_{m=0}^{K-1}  poly[k][m] * x[(s-m)*M + k]
 //      where x[] is the padded input (history prepended).
-//   2. cuFFT forward M-point batch FFT across the M phase outputs at each step.
-//      Output bin j of step s is the baseband signal for channel j.
+//   2. cuFFT forward fft_size-point batch FFT across the polyphase outputs
+//      at each step.  With fft_oversample=1: fft_size==M (critically sampled).
+//      With fft_oversample=2: fft_size==2M — the M polyphase outputs are
+//      zero-padded to 2M, giving bins at channel_bw/2 spacing.
+//   3. decarrier_process(): for fft_oversample>1 only — removes the implicit
+//      Nyquist carrier (-1)^step from odd-bin outputs before FM demodulation.
 //
-// Memory layout conventions:
+// Memory layout conventions (C = fft_size = M * fft_oversample):
 //   d_input  (padded):  [(K-1)*M  +  L*M]  cufftComplex, row-major
-//                        history              new input
-//   d_poly_phases:      [M * K]              float, row-major (phase × tap)
-//   d_phase_out:        [L * M]              cufftComplex, step-major
-//   d_channel_out:      [L * M]              cufftComplex, step-major
-//                        (FFT output in-place into d_phase_out)
+//   d_poly_phases:      [M * K]             float, row-major (phase × tap)
+//   d_phase_out:        [L * C]             cufftComplex, step-major
+//   d_output (caller):  [L * C]             cufftComplex, step-major (FFT result)
 
 #include "../../include/cuda/channelizer.h"
 
@@ -45,21 +47,25 @@
 // ---------------------------------------------------------------------------
 // Polyphase FIR filter kernel
 //
-// Grid:  (L,)  — one block per output time step
-// Block: (M,)  — one thread per phase
+// Grid:  (ceil(M/512), L)  — 2D: x=channel groups, y=time steps
+// Block: (512, 1)
 //
-// d_input_padded: [(K-1 + L) * M] complex samples
-//                  index of phase k, step s, tap m:
-//                  (K-1 + s - m) * M + k
+// d_input_padded: [(K-1 + L) * M] complex samples (M = num_phases)
+//                  index of phase k, step s, tap m: (K-1 + s - m) * M + k
+//
+// d_phase_out: [L * fft_size] — stride is fft_size (>= M).
+//   With fft_oversample=1: fft_size == M, layout identical to before.
+//   With fft_oversample=2: fft_size == 2M; entries [M..2M-1] per step are
+//   zeroed at alloc and never written here, acting as zero-padding for the
+//   oversampled FFT that follows.
 // ---------------------------------------------------------------------------
 __global__ void poly_filter_kernel(
     const cufftComplex* __restrict__ d_input_padded,
     const float*        __restrict__ d_poly,
     cufftComplex*                    d_phase_out,
-    int M, int K)
+    int M, int K, int fft_size)
 {
     // 2D grid: blockIdx.x = channel group, blockIdx.y = time step.
-    // Supports M > 1024 (CUDA max threads/block).
     const int phase = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
                     + static_cast<int>(threadIdx.x);
     const int step  = static_cast<int>(blockIdx.y);
@@ -75,7 +81,8 @@ __global__ void poly_filter_kernel(
         im += coef * s_in.y;
     }
 
-    d_phase_out[step * M + phase] = {re, im};
+    // Write with fft_size stride; zero-padding occupies [M..fft_size-1] per step.
+    d_phase_out[step * fft_size + phase] = {re, im};
 }
 
 // ---------------------------------------------------------------------------
@@ -88,9 +95,10 @@ bool channelizer_alloc(ChannelizerState& state,
                        int input_len)
 {
     const ChannelizerConfig& cfg = state.config;
-    const int M = cfg.num_phases;
-    const int K = cfg.taps_per_phase;
-    const int L = input_len / M;    // output steps per block
+    const int M        = cfg.num_phases;
+    const int K        = cfg.taps_per_phase;
+    const int fft_size = cfg.fft_size;   // M * fft_oversample
+    const int L        = input_len / M;  // output steps per block
 
     if (input_len % M != 0) {
         fprintf(stderr, "channelizer_alloc: input_len (%d) must be a multiple of M (%d)\n",
@@ -120,21 +128,27 @@ bool channelizer_alloc(ChannelizerState& state,
     CUDA_CHECK(cudaMalloc(&state.d_input, padded_samples * sizeof(cufftComplex)));
     CUDA_CHECK(cudaMemset(state.d_input, 0, padded_samples * sizeof(cufftComplex)));
 
-    // Intermediate phase filter output + cuFFT output (in-place), [L * M]
+    // Phase filter output buffer: [L * fft_size], step-major.
+    // Zeroed once here; poly_filter_kernel writes only phases [0..M-1] per step.
+    // Entries [M..fft_size-1] stay zero, acting as zero-padding for the FFT when
+    // fft_oversample > 1 (oversampled filter bank for sub-channel-bw bin spacing).
     CUDA_CHECK(cudaMalloc(&state.d_phase_out,
-                          static_cast<size_t>(L) * M * sizeof(cufftComplex)));
+                          static_cast<size_t>(L) * fft_size * sizeof(cufftComplex)));
+    CUDA_CHECK(cudaMemset(state.d_phase_out, 0,
+                          static_cast<size_t>(L) * fft_size * sizeof(cufftComplex)));
 
-    // cuFFT plan: M-point C2C forward FFT, batched L times
-    // Input/output layout: d_phase_out[step * M + phase] — row-major
-    int fft_size = M;   // cufftPlanMany requires a mutable int*
+    // cuFFT plan: fft_size-point C2C forward FFT, batched L times.
+    // With fft_oversample=1: fft_size==M, critically sampled — bin spacing = channel_bw_hz.
+    // With fft_oversample=2: fft_size==2M, zero-padded  — bin spacing = channel_bw_hz/2.
+    int n_fft = fft_size;  // cufftPlanMany requires a mutable int*
     CUFFT_CHECK(cufftPlanMany(
         &state.fft_plan,
-        1,              // rank (1D)
-        &fft_size,      // n: FFT length
-        nullptr, 1, M,  // inembed, istride, idist (contiguous rows)
-        nullptr, 1, M,  // onembed, ostride, odist
+        1,                    // rank (1D)
+        &n_fft,               // n: FFT length
+        nullptr, 1, fft_size, // inembed, istride, idist
+        nullptr, 1, fft_size, // onembed, ostride, odist
         CUFFT_C2C,
-        L               // batch
+        L                     // batch
     ));
 
     return true;
@@ -151,21 +165,17 @@ int channelizer_process(ChannelizerState& state,
                         cufftComplex* d_output)
 {
     const ChannelizerConfig& cfg = state.config;
-    const int M = cfg.num_phases;
-    const int K = cfg.taps_per_phase;
-    const int L = state.input_len / M;
+    const int M        = cfg.num_phases;
+    const int K        = cfg.taps_per_phase;
+    const int fft_size = cfg.fft_size;
+    const int L        = state.input_len / M;
 
     // Shift history: copy old new-input tail into the history region.
     // Padded buffer layout: [history (K-1)*M | new input L*M]
-    // After each block, slide the last (K-1)*M samples of new input into history.
-    size_t history_bytes = static_cast<size_t>(K - 1) * M * sizeof(cufftComplex);
-    size_t tail_src_offset = static_cast<size_t>(L - (K - 1)) * M; // last (K-1)*M of new input
+    size_t history_bytes   = static_cast<size_t>(K - 1) * M * sizeof(cufftComplex);
+    size_t tail_src_offset = static_cast<size_t>(L - (K - 1)) * M;
 
     if (K > 1) {
-        // Source: last (K-1)*M samples from the *previous* block's new input,
-        // which is currently at d_input[(K-1)*M .. (K-1+L)*M - 1].
-        // We want to shift the tail of the old new-input into history for next block.
-        // Simplest: copy from the existing padded buffer's tail into history slot.
         cudaMemcpy(state.d_input,
                    state.d_input + tail_src_offset + (K - 1) * M,
                    history_bytes,
@@ -178,7 +188,7 @@ int channelizer_process(ChannelizerState& state,
                static_cast<size_t>(state.input_len) * sizeof(cufftComplex),
                cudaMemcpyDeviceToDevice);
 
-    // Polyphase FIR filter: 2D grid supports M > 1024 threads/block.
+    // Polyphase FIR filter: writes to d_phase_out with fft_size stride.
     // Grid: (ceil(M/512), L)   Block: (512, 1)
     constexpr int CHAN_W = 512;
     dim3 pf_block(CHAN_W);
@@ -187,9 +197,10 @@ int channelizer_process(ChannelizerState& state,
         state.d_input,
         state.d_poly_phases,
         state.d_phase_out,
-        M, K);
+        M, K, fft_size);
 
-    // M-point forward FFT across phases at each output step — in-place
+    // fft_size-point forward FFT batched over L steps.
+    // d_phase_out layout: [L * fft_size], with zero-padding in [M..fft_size-1] per step.
     cufftExecC2C(state.fft_plan, state.d_phase_out, d_output, CUFFT_FORWARD);
 
     return L;
@@ -202,4 +213,57 @@ void channelizer_free(ChannelizerState& state)
     if (state.d_input)        { cudaFree(state.d_input);        state.d_input        = nullptr; }
     if (state.d_phase_out)    { cudaFree(state.d_phase_out);    state.d_phase_out    = nullptr; }
     if (state.fft_plan)       { cufftDestroy(state.fft_plan);   state.fft_plan       = 0;       }
+}
+
+// ---------------------------------------------------------------------------
+// Nyquist carrier removal for oversampled (zero-padded) FFT
+//
+// For fft_oversample > 1, the zero-padded 2M FFT output for odd bin k=(2j+1)
+// carries an implicit Nyquist carrier exp(jπ·k·step) = (-1)^step (since k is
+// odd and exp(j·2π·j·step)=1 for integer j).  This ±π offset in the FM
+// demodulated output maps all P25 C4FM symbols to wrong dibits, preventing
+// frame sync.  Negating odd-bin outputs at odd steps removes the carrier.
+//
+// The batch size L=80 is always even, so the carrier phase resets to +1 at
+// every batch boundary — no inter-batch state is needed.
+//
+// Grid: (ceil(n_odd_bins / CHAN_W), L)   Block: (CHAN_W, 1)
+// n_odd_bins = fft_size / 2
+// ---------------------------------------------------------------------------
+
+__global__ void decarrier_kernel(cufftComplex* __restrict__ d_data,
+                                  int fft_size)
+{
+    // Thread j handles odd bin k = 2j+1
+    const int j    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                   + static_cast<int>(threadIdx.x);
+    const int step = static_cast<int>(blockIdx.y);
+    const int k    = 2 * j + 1;
+    if (k >= fft_size) return;
+
+    if (step & 1) {
+        const int idx = step * fft_size + k;
+        d_data[idx].x = -d_data[idx].x;
+        d_data[idx].y = -d_data[idx].y;
+    }
+}
+
+void decarrier_process(ChannelizerState& state, cufftComplex* d_output, int L)
+{
+    const int fft_size   = state.config.fft_size;
+    const int num_phases = state.config.num_phases;
+
+    static int decarrier_call_count = 0;
+    if (++decarrier_call_count <= 3)
+        fprintf(stderr, "decarrier_process: call#%d fft_size=%d num_phases=%d L=%d ptr=%p %s\n",
+                decarrier_call_count, fft_size, num_phases, L, (void*)d_output,
+                (fft_size == num_phases) ? "SKIPPING(critically sampled)" : "RUNNING");
+
+    if (fft_size == num_phases) return;  // critically sampled: no odd bins
+
+    const int n_odd = fft_size / 2;
+    constexpr int CHAN_W = 512;
+    dim3 blk(CHAN_W);
+    dim3 grd((n_odd + CHAN_W - 1) / CHAN_W, L);
+    decarrier_kernel<<<grd, blk>>>(d_output, fft_size);
 }

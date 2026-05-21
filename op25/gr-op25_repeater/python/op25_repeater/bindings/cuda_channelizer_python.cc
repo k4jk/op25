@@ -9,7 +9,7 @@
 /* BINDTOOL_GEN_AUTOMATIC(0) */
 /* BINDTOOL_USE_PYGCCXML(0) */
 /* BINDTOOL_HEADER_FILE(cuda_channelizer.h) */
-/* BINDTOOL_HEADER_FILE_HASH(7fb813dd40833b648ea0fd928fb0374e) */
+/* BINDTOOL_HEADER_FILE_HASH(b96d4dfc44eeb34a3b38904c3f11bc2c) */
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>

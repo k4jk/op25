@@ -37,6 +37,7 @@ import gnuradio.op25_repeater as op25_repeater
 
 CC_TIMEOUT_RETRIES = 3   # Number of control channel framing timeouts before hunting
 VC_TIMEOUT_RETRIES = 3   # Number of voice channel framing timeouts before expiry
+VOICE_HOLD_MIN_S   = 0.5  # Seconds before a terminator can expire a voice pool slot after tune_voice()
 TGID_DEFAULT_PRIO = 3    # Default tgid priority when unassigned
 TGID_HOLD_TIME = 2.0     # Number of seconds to give previously active tgid exclusive channel access
 TGID_SKIP_TIME = 4.0     # Number of seconds to blacklist a previously skipped tgid
@@ -166,6 +167,36 @@ class rx_ctl(object):
                                    'rx_rcvr':    rx_rcvr,
                                    'conv_state': conv_state}
 
+    def set_cc_dedicated(self, msgq_id):
+        """Mark an already-registered receiver as the permanent CC slot.
+
+        Called by multi_rx.configure_cuda_voice_pool() after configure_channels()
+        has registered all channels via add_receiver().  Setting cc_dedicated=True
+        prevents scan_for_talkgroups() from ever reassigning this slot to voice.
+        """
+        if msgq_id not in self.receivers or self.receivers[msgq_id]['rx_rcvr'] is None:
+            sys.stderr.write('%s set_cc_dedicated(%d): receiver not found\n'
+                             % (log_ts.get(), msgq_id))
+            return
+        self.receivers[msgq_id]['rx_rcvr'].cc_dedicated = True
+        sys.stderr.write('%s [%d] marked CC-dedicated\n' % (log_ts.get(), msgq_id))
+
+    def set_voice_pool(self, msgq_id):
+        """Mark an already-registered receiver as a voice pool slot.
+
+        Called by multi_rx.configure_cuda_voice_pool() after configure_channels()
+        has registered all channels via add_receiver().  Setting cc_capable=False
+        prevents check_cc_assignments() from promoting this slot to CC duty.
+        """
+        if msgq_id not in self.receivers or self.receivers[msgq_id]['rx_rcvr'] is None:
+            sys.stderr.write('%s set_voice_pool(%d): receiver not found\n'
+                             % (log_ts.get(), msgq_id))
+            return
+        rx = self.receivers[msgq_id]['rx_rcvr']
+        rx.cc_capable = False
+        rx.tuner_idle = True
+        sys.stderr.write('%s [%d] marked voice pool\n' % (log_ts.get(), msgq_id))
+
     # post_init is called once after all receivers have been created
     def post_init(self):
         for rx in self.receivers:
@@ -176,6 +207,26 @@ class rx_ctl(object):
         if self.debug >= 10:
             sys.stderr.write("%s [rx_ctl] post initialize check control channel assignments\n" % (log_ts.get()))
         self.check_cc_assignments()
+        # Verify dict and list references are the same Python object for every receiver.
+        if self.debug >= 5:
+            for msgq_id, entry in self.receivers.items():
+                dict_obj = entry['rx_rcvr']
+                sysname  = entry['sysname']
+                if dict_obj is None:
+                    sys.stderr.write('object check: msgq_id=%d rx_rcvr=None (conventional or unknown sysname)\n' % msgq_id)
+                    continue
+                if sysname not in self.systems:
+                    sys.stderr.write('object check: msgq_id=%d sysname=%r not in self.systems — orphan dict entry!\n' % (msgq_id, sysname))
+                    continue
+                rx_list = self.systems[sysname]['receivers']
+                list_ids = [id(o) for o in rx_list]
+                if id(dict_obj) in list_ids:
+                    list_idx = list_ids.index(id(dict_obj))
+                    sys.stderr.write('object check: msgq_id=%d dict_id=%d list[%d]_id=%d same=True\n'
+                                     % (msgq_id, id(dict_obj), list_idx, id(rx_list[list_idx])))
+                else:
+                    sys.stderr.write('object check: msgq_id=%d dict_id=%d NOT IN LIST (list has %d entries: %s)\n'
+                                     % (msgq_id, id(dict_obj), len(rx_list), [id(o) for o in rx_list]))
 
     # process_qmsg is the main message dispatch handler connecting the 'radios' to python
     def process_qmsg(self, msg):
@@ -262,7 +313,7 @@ class rx_ctl(object):
                 if self.debug >= 10:
                     sys.stderr.write("%s [%s] needs control channel receiver\n" % (log_ts.get(), p25_sysname))
                 for rx in self.systems[p25_sysname]['receivers']:
-                    if rx.tuner_idle:
+                    if rx.tuner_idle and rx.cc_capable:   # voice pool slots (cc_capable=False) never take CC
                         if self.debug >= 10:
                             sys.stderr.write("%s [%s] attempt to assign control channel receiver[%d]\n" % (log_ts.get(), p25_sysname, rx.msgq_id))
                         rx.tune_cc(p25_system.get_cc(rx.msgq_id))
@@ -2205,6 +2256,8 @@ class p25_receiver(object):
         self.meta_stream = from_dict(self.config, 'meta_stream_name', "")
         self.tuned_frequency = freq
         self.tuner_idle = False
+        self.cc_dedicated = False   # True: never follows voice, permanently on CC
+        self.cc_capable   = True    # False: never assigned CC duty (voice pool slots)
         self.talkgroups = self.system.get_talkgroups()
         self.skiplist = {}
         self.blacklist = {}
@@ -2219,6 +2272,7 @@ class p25_receiver(object):
         self.tgid_hold_time = TGID_HOLD_TIME
         self.vc_retries = 0
         self.tune_ts = None
+        self.expire_ts = None
         self.mot_talker_alias = None
         
         self.fa_ctrl({'tuner': self.msgq_id, 'cmd': 'crypt_behavior', 'behavior': self.crypt_behavior})
@@ -2267,10 +2321,15 @@ class p25_receiver(object):
 
     def idle_rx(self):
         if not (self.tuner_idle or self.system.has_cc(self.msgq_id)): # don't idle a control channel or an already idle receiver
-            if self.debug >= 5:
-                sys.stderr.write("%s [%d] idling receiver\n" % (log_ts.get(), self.msgq_id))
+            sys.stderr.write("%s [%d] idle_rx: cc_capable=%s cc_dedicated=%s\n" % (log_ts.get(), self.msgq_id, self.cc_capable, self.cc_dedicated))
             if self.fa_ctrl is not None:
                 self.fa_ctrl({'tuner': self.msgq_id, 'cmd': 'set_slotid', 'slotid': 4})      # disable receiver (idle)
+            if not self.cc_capable and self.frequency_set is not None:
+                # Voice pool CUDA slot: clear the channelizer bin so it stops producing dibits.
+                self.frequency_set({'tuner': self.msgq_id, 'freq': 0, 'sigtype': 'P25',
+                                    'tgid': None, 'offset': 0, 'tag': '', 'nac': 0,
+                                    'system': '', 'center_frequency': 0,
+                                    'tdma': None, 'wacn': None, 'sysid': None})
             self.tuner_idle = True
             self.current_slot = None
 
@@ -2302,6 +2361,7 @@ class p25_receiver(object):
             return
 
         self.tune_ts = time.time()                                                          # save timestamp at start of tuning
+        self.expire_ts = None                                                               # clear re-acquisition holdoff on successful tune
 
         if self.tuner_idle:
             if self.fa_ctrl is not None:
@@ -2379,6 +2439,10 @@ class p25_receiver(object):
         m_rxid = int(msg.arg1()) >> 1
         m_ts = float(msg.arg2())
 
+        if not self.cc_capable and self.current_tgid is not None and self.debug >= 5:
+            sys.stderr.write('[%d] m_type=%d tgid=%s\n'
+                             % (self.msgq_id, m_type, self.current_tgid))
+
         if (m_type == -1):  # Channel Timeout
             updated += 1
             if self.current_tgid is None:
@@ -2387,9 +2451,12 @@ class p25_receiver(object):
                         sys.stderr.write("%s [%d] control channel timeout, freq(%f)\n" % (log_ts.get(), self.msgq_id, (self.tuned_frequency/1e6)))
                     self.tune_cc(self.system.timeout_cc(self.msgq_id))
             else:
-                if self.debug > 1:
+                if self.debug > 1 and self.cc_capable:
                     sys.stderr.write("%s [%d] voice channel timeout, freq(%f)\n" % (log_ts.get(), self.msgq_id, (self.tuned_frequency/1e6)))
                 self.vc_retries += 1
+                if not self.cc_capable and self.debug >= 5:
+                    sys.stderr.write('[%d] m_type=-1 vc_retries now %d/%d tgid=%s\n'
+                                     % (self.msgq_id, self.vc_retries, VC_TIMEOUT_RETRIES, self.current_tgid))
                 if self.vc_retries >= VC_TIMEOUT_RETRIES:
                     self.expire_talkgroup(reason="timeout")
             return updated
@@ -2416,7 +2483,12 @@ class p25_receiver(object):
                     self.talkgroups[self.current_tgid]['keyid'] = keyid
 
             updated += self.system.update_talkgroup_srcaddr(curr_time, self.current_tgid, srcaddr)
-            
+            if not self.cc_capable:
+                self.vc_retries = 0   # valid voice header decoded with correct tgid — call is real
+                if self.debug >= 5:
+                    sys.stderr.write('[%d] HDU decoded tgid=%s vc_retries reset to 0\n'
+                                     % (self.msgq_id, self.current_tgid))
+
             #self.fa_ctrl({'tuner': self.msgq_id, 'cmd': 'crypt_behavior', 'behavior': self.crypt_behavior})
 
             if self.crypt_behavior > 1:
@@ -2430,13 +2502,14 @@ class p25_receiver(object):
             if self.tune_ts is not None:
                 if self.debug > 1:
                     sys.stderr.write('%s [%d] sync established, tuning time %f seconds\n' % (log_ts.get(), self.msgq_id, (time.time() - self.tune_ts)))
-                self.tune_ts = None
 
             if self.current_tgid is None:
                 if self.system.has_cc(self.msgq_id):
                     self.system.sync_cc()
-            else:
-                self.vc_retries = 0
+            # Do NOT reset vc_retries here for voice pool receivers: noise dibits
+            # produce false sync hits that would otherwise permanently prevent
+            # vc_retries from reaching VC_TIMEOUT_RETRIES.  Reset happens instead
+            # in m_type=-3 / m_type=16 when real decoded voice confirms the call.
             return updated
 
         elif m_type >= 0: # Channel Signaling (m_type is duid)
@@ -2447,11 +2520,38 @@ class p25_receiver(object):
                 return updated
 
             if   m_type ==  3: # call termination, no release
-                pass
+                sys.stderr.write('%s DUID3 msgq_id=%d cc_capable=%s current_tgid=%s\n'
+                                 % (log_ts.get(), self.msgq_id, self.cc_capable, self.current_tgid))
+                # Voice pool receivers (cc_capable=False) track an active call; TDU means it ended.
+                # CC receivers pass — they observe voice channel traffic and take no action here.
+                if not self.cc_capable:
+                    hold = (time.time() - self.tune_ts) if self.tune_ts is not None else 999.0
+                    if hold >= VOICE_HOLD_MIN_S:
+                        self.expire_talkgroup(reason="duid3")
+                        updated += 1
+                    else:
+                        sys.stderr.write('%s [%d] DUID3 ignored: %.3fs since tune (min %.1fs) — stale from prev call\n'
+                                         % (log_ts.get(), self.msgq_id, hold, VOICE_HOLD_MIN_S))
 
             elif m_type == 15: # call termination, with release
-                self.expire_talkgroup(reason="duid15")
-                updated += 1
+                sys.stderr.write('%s DUID15 msgq_id=%d cc_capable=%s tgid=%s\n'
+                                 % (log_ts.get(), self.msgq_id, self.cc_capable, self.current_tgid))
+                if not self.cc_capable:
+                    if self.debug >= 5:
+                        sys.stderr.write('DUID15 hold_debug: tune_ts=%s now=%s hold=%.3f\n'
+                                         % (self.tune_ts, time.time(),
+                                            (time.time() - self.tune_ts) if self.tune_ts is not None else 999.0))
+                    hold = (time.time() - self.tune_ts) if self.tune_ts is not None else 999.0
+                    if hold >= VOICE_HOLD_MIN_S:
+                        self.expire_talkgroup(reason="duid15")
+                        updated += 1
+                    else:
+                        sys.stderr.write('%s [%d] DUID15 ignored: %.3fs since tune (min %.1fs) — stale from prev call\n'
+                                         % (log_ts.get(), self.msgq_id, hold, VOICE_HOLD_MIN_S))
+                else:
+                    if self.current_tgid is not None:   # no-op when CC has no active voice call
+                        self.expire_talkgroup(reason="duid15")
+                        updated += 1
 
             elif m_type == 16: # MAC_PTT
                 mi    = get_ordinals(s[0:9])
@@ -2462,6 +2562,11 @@ class p25_receiver(object):
                 if self.debug >= 10:
                     sys.stderr.write('%s [%d] mac_ptt: mi: %018x algid: %02x keyid:%04x ga: %d sa: %d\n' % (log_ts.get(), m_rxid, mi, algid, keyid, ga, sa))
                 updated += self.system.update_talkgroup_srcaddr(curr_time, ga, sa)
+                if not self.cc_capable:
+                    self.vc_retries = 0   # Phase 2 MAC_PTT decoded — real call on this slot
+                    if self.debug >= 5:
+                        sys.stderr.write('[%d] MAC_PTT decoded ga=%s vc_retries reset to 0\n'
+                                         % (self.msgq_id, ga))
                 if algid != 0x80: # log and save encryption information
                     with self.system.talkgroups_mutex:
                         if ga in self.talkgroups:
@@ -2482,11 +2587,21 @@ class p25_receiver(object):
             elif m_type == 17: # MAC_END_PTT
                 sa    = get_ordinals(s[12:15])
                 ga    = get_ordinals(s[15:17])
-                if self.debug >= 10:
-                    sys.stderr.write('%s [%d] mac_end_ptt: ga: %d sa: %d\n' % (log_ts.get(), m_rxid, ga, sa))
+                sys.stderr.write('%s MAC_END_PTT msgq_id=%d cc_capable=%s tgid=%s\n'
+                                 % (log_ts.get(), self.msgq_id, self.cc_capable, self.current_tgid))
                 self.system.update_talkgroup_srcaddr(curr_time, ga, sa)
-                self.expire_talkgroup(reason="duid15")
-                updated += 1
+                if not self.cc_capable:
+                    hold = (time.time() - self.tune_ts) if self.tune_ts is not None else 999.0
+                    if hold >= VOICE_HOLD_MIN_S:
+                        self.expire_talkgroup(reason="duid15")
+                        updated += 1
+                    else:
+                        sys.stderr.write('%s [%d] MAC_END_PTT ignored: %.3fs since tune (min %.1fs) — stale from prev call\n'
+                                         % (log_ts.get(), self.msgq_id, hold, VOICE_HOLD_MIN_S))
+                else:
+                    if self.current_tgid is not None:   # no-op when CC has no active voice call
+                        self.expire_talkgroup(reason="duid15")
+                        updated += 1
 
         return updated
 
@@ -2612,12 +2727,27 @@ class p25_receiver(object):
         return None, None, None, None
 
     def scan_for_talkgroups(self, curr_time):
+        if self.cc_dedicated:
+            return   # CC-dedicated slot stays on CC regardless of talkgroup activity
+        if not self.cc_capable:
+            now = time.time()
+            if self.expire_ts is not None:
+                remaining = VOICE_HOLD_MIN_S - (now - self.expire_ts)
+                if self.debug >= 5:
+                    sys.stderr.write('scan_holdoff: msgq_id=%d expire_ts=%.3f remaining=%.3f\n'
+                                     % (self.msgq_id, self.expire_ts, remaining))
+                if remaining > 0:
+                    return
         self.check_expired_hold(curr_time)
         hold_active = True if self.hold_tgid is not None and self.hold_mode is True else False  # manual holds are not pre-emptable
         tgid_target = self.hold_tgid if self.hold_tgid is not None else self.current_tgid       # auto hold vs call in progress
         freq, tgid, slot, src = self.find_talkgroup(curr_time, tgid=tgid_target, hold=hold_active)
 
         if self.current_tgid is not None and self.current_tgid == tgid:                         # active call unchanged, nothing to do
+            if self.debug >= 5:
+                sys.stderr.write('tune_ts refresh: msgq_id=%d tgid=%s at %.3f\n'
+                                 % (self.msgq_id, tgid, time.time()))
+            self.tune_ts = time.time()   # refresh so debounce guard uses this grant, not the original assignment
             return
 
         if tgid is None or freq is None:                                                        # no call
@@ -2649,6 +2779,8 @@ class p25_receiver(object):
             meta_update(self.meta_q, msgq_id=self.msgq_id, debug=self.debug)
 
     def expire_talkgroup(self, tgid=None, update_meta = True, reason="unk", auto_hold = True):
+        sys.stderr.write('%s expire_talkgroup msgq_id=%d current_tgid=%s reason=%s\n'
+                         % (log_ts.get(), self.msgq_id, self.current_tgid, reason))
         if self.current_tgid is None:
             return
             
@@ -2674,6 +2806,11 @@ class p25_receiver(object):
 
         self.current_tgid = None
         self.current_slot = None
+        if not self.cc_capable:
+            self.expire_ts = time.time()
+            if self.debug >= 5:
+                sys.stderr.write('expire_ts SET: msgq_id=%d expire_ts=%.3f\n'
+                                 % (self.msgq_id, self.expire_ts))
         self.fa_ctrl({"tuner": self.msgq_id, "cmd": "call_end"})    # Drop any persistent ESS data held in the receiver
 
         if reason == "preempt":                             # Do not retune or update metadata if in middle of tuning to a different tgid
@@ -2742,6 +2879,7 @@ class p25_receiver(object):
             d['encrypted'] = self.talkgroups[self.current_tgid]['encrypted'] if self.current_tgid is not None else 0
             d['emergency'] = (d['svcopts'] >> 7) & 0x1
             d['hold_tgid'] = self.hold_tgid if self.hold_tgid is not None else 0
+            d['current_tgid'] = self.current_tgid
             d['mode'] = None
             d['stream'] = self.meta_stream
             d['msgqid'] = self.msgq_id

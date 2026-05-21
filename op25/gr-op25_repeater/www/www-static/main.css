@@ -154,6 +154,10 @@ input[type="checkbox"]:checked::after {
   border-color: #66ccff;
 }
 
+#btn-auto-focus {
+  font-size: 0.8em;
+}
+
 /* Main info area */
 .main-info {
   width: 60%;

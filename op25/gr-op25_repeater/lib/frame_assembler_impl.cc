@@ -64,6 +64,9 @@ namespace gr {
             } else if (cmd == "set_nac") {
                 if (d_sync)
                     d_sync->set_nac(j["nac"].get<int>());
+            } else if (cmd == "set_p25_mode") {
+                if (d_sync)
+                    d_sync->set_p25_mode(j["mode"].get<int>());
             } else if (cmd == "sync_reset") {
                 if (d_sync)
                     d_sync->sync_reset();

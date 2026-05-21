@@ -566,7 +566,7 @@ class rx_block (gr.top_block):
         self.meta_streams = {}
         self.trunking = None
         self.du_watcher = None
-        self.rx_q = gr.msg_queue(100)
+        self.rx_q = gr.msg_queue(1000)
         self._cuda_chans = []          # cuda_channelizer blocks (one per CUDA-enabled device)
         self._cuda_devs = []           # devices feeding each channelizer (parallel to _cuda_chans)
         self._cuda_centers = []        # center freqs (Hz) for frequency-to-channelizer routing
@@ -626,6 +626,7 @@ class rx_block (gr.top_block):
                     _jcfg_inner['center_freq_hz'] = actual_center
                     _jcfg_inner['sample_rate_hz'] = actual_rate
                     _jcfg_inner['max_channels']   = max_channels
+                    _jcfg_inner['fft_oversample'] = int(dev_raw.get('fft_oversample', 1))
                     # Give each device unique control/status ports to avoid bind conflicts.
                     if base_ctrl_port:
                         _jcfg_inner['control_port']  = base_ctrl_port   + _dev_idx * 2
@@ -657,6 +658,10 @@ class rx_block (gr.top_block):
                     sys.stderr.write('CUDA channelizer unavailable for device %s: %s\n'
                                      % (dev.name, e))
         self.configure_channels(config['channels'])
+
+        # Mark CC and voice pool slots for CUDA devices with multiple channels configured.
+        if self._cuda_chans:
+            self.configure_cuda_voice_pool()
 
         # GR requires every output port of cuda_channelizer to be connected.
         # Pad any slots that configure_channels() didn't use with null_sinks.
@@ -872,13 +877,91 @@ class rx_block (gr.top_block):
                     chan.raw_sink = blocks.file_sink(gr.sizeof_char, str(cfg['raw_output']))
                     self.connect(chan.demod, chan.raw_sink)
 
+    def configure_cuda_voice_pool(self):
+        """Mark CC and voice pool receivers for already-configured CUDA channels.
+
+        configure_channels() has already created all channel objects and wired
+        each CUDA channelizer output port to its frame_assembler.  This method
+        tells the trunking layer which slot is the permanent CC and which slots
+        are the voice pool.
+
+        Per-system CC selection: for each (device, trunking_sysname) pair the
+        channel with "cc": true in its config is marked cc_dedicated.  If no
+        channel carries "cc": true for a given sysname, the lowest CUDA slot for
+        that sysname is used as a backward-compatible fallback (with a warning).
+        All remaining slots on the device are marked voice pool.
+
+        Example channel config entries for a two-system single-SDR setup:
+
+            {"name": "SysA CC",    "device": "sdr0", "trunking_sysname": "SYSA", "cc": true,  ...}
+            {"name": "SysA Voice", "device": "sdr0", "trunking_sysname": "SYSA", ...}
+            {"name": "SysB CC",    "device": "sdr0", "trunking_sysname": "SYSB", "cc": true,  ...}
+            {"name": "SysB Voice", "device": "sdr0", "trunking_sysname": "SYSB", ...}
+        """
+        for _cidx, dev in enumerate(self._cuda_devs):
+            # Gather all channels on this device sorted by CUDA local slot index.
+            device_chans = sorted(
+                ((self._cuda_slots[ch.msgq_id][1], ch)
+                 for ch in self.channels
+                 if ch.device == dev and ch.msgq_id in self._cuda_slots),
+                key=lambda x: x[0])
+
+            if len(device_chans) < 2:
+                sys.stderr.write('CUDA voice pool: device=%s has %d channel(s) — '
+                                 'add voice channel entries to config to enable voice pool\n'
+                                 % (dev.name, len(device_chans)))
+                continue
+
+            if self.trunking is None:
+                continue
+
+            # Build per-sysname channel lists (slot order preserved).
+            sysname_chans = {}
+            for _lslot, ch in device_chans:
+                sysname = ch.config.get('trunking_sysname', '')
+                sysname_chans.setdefault(sysname, []).append((_lslot, ch))
+
+            # Select CC channel per sysname: prefer "cc": true, fall back to
+            # lowest slot with a warning.
+            cc_msgq_ids = set()
+            for sysname, chans in sysname_chans.items():
+                if not sysname:
+                    continue
+                explicit = [(_s, ch) for _s, ch in chans if ch.config.get('cc', False)]
+                if explicit:
+                    _lslot, cc_ch = explicit[0]
+                else:
+                    _lslot, cc_ch = chans[0]
+                    sys.stderr.write(
+                        'WARNING: no cc:true channel found for sysname=%s on device=%s, '
+                        'defaulting to slot %d (msgq_id=%d) — '
+                        'add "cc": true to your CC channel config\n'
+                        % (sysname, dev.name, _lslot, cc_ch.msgq_id))
+                cc_msgq_ids.add(cc_ch.msgq_id)
+
+            cc_chans    = [(_s, ch) for _s, ch in device_chans if ch.msgq_id in cc_msgq_ids]
+            voice_chans = [(_s, ch) for _s, ch in device_chans if ch.msgq_id not in cc_msgq_ids]
+
+            for _lslot, ch in cc_chans:
+                sysname = ch.config.get('trunking_sysname', '?')
+                freq    = int(ch.config.get('frequency', 0))
+                self.trunk_rx.set_cc_dedicated(ch.msgq_id)
+                sys.stderr.write('CUDA CC: sysname=%s slot=%d msgq_id=%d freq=%d\n'
+                                 % (sysname, _lslot, ch.msgq_id, freq))
+            for _, ch in voice_chans:
+                self.trunk_rx.set_voice_pool(ch.msgq_id)
+
+            sys.stderr.write('CUDA voice pool: device=%s voice=%d slots (msgq_ids %s)\n'
+                             % (dev.name, len(voice_chans),
+                                ','.join(str(ch.msgq_id) for _, ch in voice_chans)))
+
     def scan_channels(self):
         for chan in self.channels:
             sys.stderr.write('scan %s: error %d\n' % (chan.config['frequency'], chan.demod.get_freq_error()))
 
     def change_freq(self, params):
         tuner = params['tuner']
-        if (tuner < 0) or (tuner > len(self.channels)):
+        if (tuner < 0) or (tuner >= len(self.channels)):
             if self.verbosity:
                 sys.stderr.write("%s No %s channel available for tuning\n" % (log_ts.get(), params['tuner']))
             return False
@@ -891,12 +974,24 @@ class rx_block (gr.top_block):
             _chan_block = self._cuda_chans[_cidx]
             freq = params.get('freq', 0)
             tdma = params.get('tdma')
-            p25_mode = 2 if (tdma is not None) else 1
             tdma_slot = int(tdma) if (tdma is not None) else 0
+            if tdma is not None:
+                p25_mode = 2   # Phase 2 H-DQPSK TDMA
+            elif self.channels[tuner].config.get('demod_type', '').lower() == 'cqpsk':
+                p25_mode = 3   # Phase 1 CQPSK: IQ Gardner + derotation + differential decode
+            else:
+                p25_mode = 1   # Phase 1 FM/FSK4
             if freq:
                 _chan_block.set_channel(_lslot, float(freq), tdma_slot, p25_mode)
+                self.channels[tuner].decoder.control(
+                    json.dumps({'cmd': 'set_p25_mode', 'mode': p25_mode}))
             else:
                 _chan_block.clear_channel(_lslot)
+                # Slot released back to pool — reset decoder and return.
+                # skip set_freq() so the unused demod doesn't log spurious errors.
+                self.channels[tuner].decoder.control(
+                    json.dumps({'tuner': tuner, 'cmd': 'sync_reset'}))
+                return True
 
         chan = self.channels[tuner]
         if 'sigtype' in params and params['sigtype'] == "P25": # P25 specific config

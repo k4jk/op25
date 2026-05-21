@@ -1238,6 +1238,10 @@ class rx_ctl (object):
         self.current_state = self.states.CC
         self.trunked_systems = {}
         self.receivers = {}
+        self._cc_tuner = None      # msgq_id of the CC tuner (set by first add_receiver call)
+        self._voice_pool = []      # sorted free voice tuner msgq_ids
+        self._voice_active = {}    # msgq_id → tgid for currently-busy voice slots
+        self._multi_slot = False   # True once add_voice_receiver() has been called
         self.frequency_set = frequency_set
         self.fa_ctrl = fa_ctrl
         self.meta_update = meta_update
@@ -1291,11 +1295,22 @@ class rx_ctl (object):
     def add_receiver(self, msgq_id, config, meta_q = None, freq = 0):
         self.config = config
         self.receivers[msgq_id] = msgq_id
+        if self._cc_tuner is None:
+            self._cc_tuner = msgq_id   # first registered receiver is the CC tuner
         self.last_tune_freq = freq
         self.last_tune_time = time.time()
         if meta_q is not None:
             self.meta_q = meta_q
             self.meta_update = self.update_meta
+
+    def add_voice_receiver(self, msgq_id):
+        """Register a voice-pool tuner (auto-created CUDA slot) for dynamic voice following."""
+        if msgq_id not in self._voice_pool:
+            self._voice_pool.append(msgq_id)
+            self._voice_pool.sort()
+        self._multi_slot = True
+        sys.stderr.write('%s voice pool: registered tuner %d (pool size=%d)\n'
+                         % (log_ts.get(), msgq_id, len(self._voice_pool)))
 
     def update_meta(self, tgid = None, tag = None, rid = None):
         if self.meta_q is None:
@@ -1337,8 +1352,49 @@ class rx_ctl (object):
 
     def set_frequency(self, params):
         frequency = params['freq']
-        params['tuner'] = 0
         params['sigtype'] = "P25"
+
+        if self._multi_slot:
+            # Multi-slot CUDA mode: CC slot is permanently tuned and never remapped.
+            # Every state-machine "return to CC" path (timeout, duid15/17, hold, …)
+            # calls set_frequency(trunk_cc) — intercept here: release active voice
+            # slots back to the pool and return early without forwarding to
+            # frequency_set (which would send sync_reset to the running CC decoder).
+            # Voice grants allocate the lowest free pool slot; if the pool is
+            # exhausted the grant is dropped without disturbing existing calls.
+            tsys = self.trunked_systems.get(self.current_nac) if self.current_nac else None
+            if tsys and frequency == tsys.trunk_cc:
+                for vt in list(self._voice_active):
+                    if self.frequency_set:
+                        self.frequency_set({
+                            'tuner': vt, 'freq': 0, 'sigtype': 'P25',
+                            'tgid': None, 'offset': 0, 'tag': '',
+                            'nac': self.current_nac, 'system': '',
+                            'center_frequency': 0,
+                            'tdma': None, 'wacn': None, 'sysid': None})
+                    self._voice_pool.append(vt)
+                self._voice_active.clear()
+                self._voice_pool.sort()
+                self.last_tune_freq = frequency
+                self.current_slot = params.get('tdma')
+                return
+            else:
+                if not self._voice_pool:
+                    sys.stderr.write('%s voice pool exhausted — dropping grant '
+                                     'freq=%d tgid=%s\n'
+                                     % (log_ts.get(), frequency, self.current_tgid))
+                    return
+                vt = self._voice_pool.pop(0)
+                self._voice_active[vt] = self.current_tgid
+                params['tuner'] = vt
+                sys.stderr.write('%s voice grant: tuner=%d tgid=%s freq=%d '
+                                 '(pool_free=%d)\n'
+                                 % (log_ts.get(), vt, self.current_tgid,
+                                    frequency, len(self._voice_pool)))
+        else:
+            # Legacy single-tuner mode (non-CUDA or no voice pool registered).
+            params['tuner'] = 0
+
         if frequency and self.frequency_set:
             if self.debug > 10:
                 sys.stderr.write("%s set_frequency(%s)\n" % (log_ts.get(), frequency))

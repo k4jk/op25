@@ -1,7 +1,9 @@
 {
     "channelizer": {
+        "#taps_per_phase": "MUST be an ODD integer. K-parity theorem (fft_oversample=2 only): even K causes zero response at ALL odd FFT bins (G_odd=0). K=24 silences every other channel. K=25 gives odd bins -3.92 dB SNR vs even bins — acceptable, and is the best possible for any odd K. No penalty for fft_oversample=1. Widening fc to 3/(4M) does NOT reduce the penalty and destroys half-bin isolation. Do not 'round down' to an even number.",
+        "#center_freq_hz": "CENTER FREQUENCY SELECTION (fft_oversample=2 only): each P25 channel lands on an even bin (0 dB, full gain) or an odd bin (-3.92 dB) depending on whether its offset from center is an even or odd multiple of channel_bw_hz/2. Channels whose offset/channel_spacing is odd suffer the SNR penalty. To determine which sub-grid a system uses: offset_bins = round((channel_hz - center_hz) / (channel_bw_hz/2)). Even offset_bins → even bin (full gain). Strategy: identify the most critical or weakest-signal system, compute what center_hz places its control channels on even bins, then accept the penalty on other systems. For P25 700 MHz band (6.25 kHz channel grid from 769 MHz base): compute channel_k = (channel_hz - 769e6) / 3125; even channel_k → needs even-k center; odd channel_k → needs odd-k center. Shift center_hz by channel_bw_hz/2 to flip all parities.",
         "channel_bw_hz":  12500,
-        "taps_per_phase": 24,
+        "taps_per_phase": 25,
         "control_port":   23457,
         "status_port":    23458
     }

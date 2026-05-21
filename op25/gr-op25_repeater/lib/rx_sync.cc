@@ -68,6 +68,14 @@ void rx_sync::reset_timer(void) {
 }
 
 void rx_sync::sync_reset(void) {
+	// When a Phase 1 slot (d_p25_mode != 2) gets a false P25P2 sync, rx_sync
+	// transitions to RX_TYPE_P25P2 for ~0.45 s (2160-symbol expiry at 4800 baud),
+	// then calls sync_reset().  Resetting sync_timer here prevents the 1-second
+	// NONE-state timeout (m_type=-1) from ever accumulating across these rapid
+	// false-sync/expiry cycles.  Preserve sync_timer in this case so it keeps
+	// counting toward the threshold regardless of false P25P2 episodes.
+	const bool false_p2 = (d_current_type == RX_TYPE_P25P2 && d_p25_mode != 2);
+
 	if (d_debug >= 10) {
 		fprintf(stderr, "%s rx_sync::sync_reset:\n", logts.get(d_msgq_id));
 	}
@@ -95,8 +103,10 @@ void rx_sync::sync_reset(void) {
 		}
 	}
 
-	// Timers reset
-	reset_timer();
+	// Timers reset: always reset p25fdma; preserve sync_timer on false P25P2.
+	p25fdma.reset_timer();
+	if (!false_p2)
+		sync_timer.reset();
 }
 
 void rx_sync::call_end(void) {
@@ -117,6 +127,10 @@ void rx_sync::crypt_key(uint16_t keyid, uint8_t algid, const std::vector<uint8_t
 void rx_sync::set_nac(int nac) {
     p25fdma.set_nac(nac);
     p25tdma.set_nac(nac);
+}
+
+void rx_sync::set_p25_mode(int mode) {
+    d_p25_mode = mode;
 }
 
 void rx_sync::set_slot_mask(int mask) {
@@ -262,6 +276,7 @@ rx_sync::rx_sync(const char * options, log_ts& logger, int debug, int msgq_id, g
 	d_expires(0),
 	d_slot_mask(3),
 	d_slot_key(0),
+	d_p25_mode(0),
 	d_audio(op25_audio_wrapper::instance().get_audio(options, logger, debug, msgq_id)),
 	p25fdma(op25_audio_wrapper::instance().get_audio(options, logger, debug, msgq_id), logger, debug, true, false, true, queue, d_output_queue[0], true, msgq_id),
 	p25tdma(op25_audio_wrapper::instance().get_audio(options, logger, debug, msgq_id), logger, 0, debug, true, queue, d_output_queue[0], true, msgq_id),
@@ -582,7 +597,8 @@ void rx_sync::rx_sym(const uint8_t sym) {
 		break;
 	case RX_TYPE_P25P2:
 		p25tdma.handle_packet(symbol_ptr, d_fs); // passing 180 dibit packets is faster than bit-shuffling via p25tdma::rx_sym()
-        p25fdma.reset_timer();                   // reset FDMA timer in case of long TDMA transmissions
+		if (d_p25_mode == 2)                     // only reset FDMA timer on genuine TDMA slots
+			p25fdma.reset_timer();               // Phase 1 slots getting false P25P2 syncs must not reset the P1 timeout
 		break;
 	case RX_TYPE_DMR:
 		// frame with explicit sync resets expiration counter

@@ -40,6 +40,11 @@ bool compute_config(ChannelizerConfig& cfg, char* error_msg)
     cfg.stage1_output_rate_hz = cfg.channel_bw_hz;
     cfg.stage2_output_rate_hz = cfg.channel_bw_hz;
 
+    // fft_oversample: 1 = critically sampled (default), 2 = zero-padded 2M FFT
+    // giving half-bin (channel_bw_hz/2) spacing without changing output sample rate.
+    if (cfg.fft_oversample < 1) cfg.fft_oversample = 1;
+    cfg.fft_size = cfg.num_phases * cfg.fft_oversample;
+
     return true;
 }
 

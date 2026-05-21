@@ -36,6 +36,7 @@ namespace gr {
                 virtual void set_slot_mask(int mask) = 0;
                 virtual void set_slot_key(int mask) = 0;
                 virtual void set_nac(int nac) = 0;
+                virtual void set_p25_mode(int mode) {}
                 virtual void set_debug(int debug) = 0;
                 virtual void dump_buffer() { };
                 // Crypt_behavior
