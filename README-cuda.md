@@ -210,6 +210,92 @@ Note: You may need to play with device buffering in the device args to make sure
 
 Example for UHD Devices: Something like num_recv_frames=64,recv_frame_size=16360
 
+### Channel entries: CC designation and voice slot count
+
+Each entry in the `"channels"` array that shares a `trunking_sysname` with a CUDA
+device becomes either the **control channel** slot or a **voice pool** slot,
+depending on whether it carries `"cc": true`.
+
+#### Why `"cc": true` matters
+
+When `multi_rx.py` starts, `configure_cuda_voice_pool()` inspects all channel
+entries on each CUDA device and assigns roles:
+
+- The channel with `"cc": true` for a given `trunking_sysname` is marked
+  **CC-dedicated** (`cc_dedicated = True`). This slot is permanently locked to
+  control channel duty — the trunking layer will never reassign it to decode a
+  voice call, even if the system is quiet.
+- All other channels on the same device and sysname are marked **voice pool**
+  (`cc_capable = False`, `tuner_idle = True`). These slots sit idle until the
+  trunking layer assigns them a grant.
+
+Without `"cc": true`, the code falls back to using the lowest-indexed slot for
+that sysname as the CC and logs a warning:
+
+```
+WARNING: no cc:true channel found for sysname=BIGSYSTEM on device=sdr0,
+defaulting to slot 0 (msgq_id=0) — add "cc": true to your CC channel config
+```
+
+The fallback works for single-system configs, but becomes unreliable when you
+run multiple trunked systems on a single wideband SDR. In that case, each
+system needs its own dedicated CC slot, and without explicit `"cc": true` markers
+the code has no way to know which slot belongs to which system's control channel.
+
+Marking the CC explicitly also makes the config self-documenting and prevents
+subtle bugs if channel list order ever changes.
+
+```json
+{
+    "channels": [
+        {
+            "name": "BIGSYSTEM CC",
+            "device": "sdr0",
+            "trunking_sysname": "BIGSYSTEM1",
+            "cc": true,
+            "frequency": 855587500,
+            "demod_type": "cqpsk"
+        },
+        {
+            "name": "BIGSYSTEM Voice 1",
+            "device": "sdr0",
+            "trunking_sysname": "BIGSYSTEM",
+            "destination": "ws://0.0.0.0:9009",
+            "demod_type": "cqpsk"
+        },
+        {
+            "name": "BIGSYSTEM Voice 2",
+            "device": "sdr0",
+            "trunking_sysname": "BIGSYSTEM",
+            "destination": "ws://0.0.0.0:9010",
+            "demod_type": "cqpsk"
+        }
+    ]
+}
+```
+
+#### Choosing the number of voice slots
+
+The number of voice pool slots is simply the number of non-CC channel entries you
+add for a given sysname. There is no separate counter — each channel entry becomes
+one decoder slot. The right number depends on the busy-hour traffic of the system
+you are monitoring:
+
+- **One slot per simultaneous call you want to hear.** A system that routinely has
+  3–4 simultaneous voice grants needs at least 3–4 voice entries.
+- **Slots consume GPU bins continuously** (once a grant is assigned, the GPU keeps
+  that FFT bin active until the call ends). More slots means more GPU load, but on
+  any modern GPU the per-slot cost is very small.
+- **`max_channels`** in the channelizer config sets the hard GPU-side ceiling on
+  how many bins can be active at once. The number of channel entries you configure
+  should not exceed `max_channels - (number of CC slots)`.
+- **Unassigned slots sit completely idle** — a voice pool slot that hasn't received
+  a grant does not process any samples and adds no load.
+
+A reasonable starting point is 4–6 voice entries for a moderately busy P25 system.
+You can add more entries (and rebuild nothing — it is pure config) if you observe
+grants being dropped because all slots are occupied.
+
 ### fft_oversample guidance
 
 - **`fft_oversample: 1`** — Recommended for most deployments. No odd-bin SNR
