@@ -253,22 +253,23 @@ subtle bugs if channel list order ever changes.
             "device": "sdr0",
             "trunking_sysname": "BIGSYSTEM",
             "cc": true,
-            "frequency": 855587500,
             "demod_type": "cqpsk"
         },
         {
-            "name": "BIGSYSTEM Voice 1",
+            "name": "BIGSYSTEM Law Enforcement",
             "device": "sdr0",
             "trunking_sysname": "BIGSYSTEM",
             "destination": "ws://0.0.0.0:9009",
-            "demod_type": "cqpsk"
+            "demod_type": "cqpsk",
+            "whitelist": "BIGSYSTEM_LE.wlist"
         },
         {
-            "name": "BIGSYSTEM Voice 2",
+            "name": "BIGSYSTEM Fire-Rescue",
             "device": "sdr0",
             "trunking_sysname": "BIGSYSTEM",
             "destination": "ws://0.0.0.0:9010",
-            "demod_type": "cqpsk"
+            "demod_type": "cqpsk",
+            "whitelist": "BIGSYSTEM_FR.wlist"
         }
     ]
 }
