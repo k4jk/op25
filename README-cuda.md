@@ -206,14 +206,18 @@ the GPU pipeline:
 | `fft_oversample` | FFT oversampling factor. `1` = critically sampled (no odd-bin penalty, recommended for most deployments). `2` = 2× oversampled (improves channel isolation at the cost of the odd-bin SNR penalty and higher GPU memory usage). |
 | `max_channels` | Maximum simultaneous voice channels the channelizer will allocate slots for. |
 
+Note: You may need to play with device buffering in the device args to make sure samples don't get dropped, the channelizer is picky about this.
+
+Example for UHD Devices: Something like num_recv_frames=64,recv_frame_size=16360
+
 ### fft_oversample guidance
 
 - **`fft_oversample: 1`** — Recommended for most deployments. No odd-bin SNR
   penalty. Each FFT bin corresponds to exactly one 12.5 kHz channel.
 - **`fft_oversample: 2`** — Doubles GPU memory and compute. Channels that land on
   odd FFT bins suffer −3.92 dB SNR. Useful if channel isolation is a concern and
-  you can tolerate the SNR tradeoff. Requires careful center frequency selection
-  to place control channels on even bins.
+  you can tolerate the SNR tradeoff. Also might be useful on 700mhz if you have a wideband device and and want to monitor multiple 
+  systems that will require 6.25khz overall channel spacing. With careful center frequency selection you may  be able to place control all channels on even bins, it depends on your exact situation.
 
 ---
 

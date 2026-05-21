@@ -1,0 +1,118 @@
+
+{
+    "channels": [
+    {
+            "name": "Orange",
+            "device": "sdr0",
+            "trunking_sysname": "ORANGE",
+            "meta_stream_name": "",
+            "demod_type": "fsk4", 
+            "cqpsk_tracking": true,
+            "tracking_threshold": 100,
+            "tracking_feedback": 0.75,
+            "destination": "ws://0.0.0.0:9008",
+            "excess_bw": 0.2,
+            "filter_type": "rc",
+            "if_rate": 24000,
+            "plot": "",
+            "symbol_rate": 4800,
+            "enable_analog": "off",
+            "blacklist": "orange.blist",
+            "whitelist": "",
+            "crypt_keys": ""
+        }
+    ],
+    "devices": [
+        {
+            "args": "airspy=0",
+            "gains": "LNA:14,MIX:14,IF:13",
+	    "frequency": 772025000,
+	    "cuda": true,
+            "fft_oversample": 1,
+            "gain_mode": false,
+            "name": "sdr0",
+            "offset": 6250,
+            "ppm": 0.5,
+            "rate": 10000000,
+            "usable_bw_pct": 0.90,
+            "tunable": false
+        }
+    ],
+    "channelizer": {
+        "config_path": "channelizer.json",
+        "max_channels": 20
+    },
+    "trunking": {
+        "module": "tk_p25.py",
+        "chans": [
+            {
+                "nac": "0x0",
+                "sysname": "ORANGE",
+                "control_channel_list": "770.60625,769.34375,771.10625,772.49375,774.69375",
+                "whitelist": "",
+                "blacklist": "orange.blist",
+                "tgid_tags_file": "orange.tsv",
+                "rid_tags_file": "trunk-rids.tsv",
+                "tdma_cc": false,
+                "crypt_behavior": 0
+            }
+        ]
+    },
+    "metadata": {
+        "module": "icemeta.py",
+        "streams": [
+            {
+                "stream_name": "stream_0",
+                "meta_format_idle": "[idle]",
+                "meta_format_tgid": "[%TGID%]",
+                "meta_format_tag":  "[%TGID%] %TAG%",
+                "icecastServerAddress": "192.168.1.24:8000",
+                "icecastMountpoint": "op25_stream_0",
+                "icecastMountExt": ".xspf",
+                "icecastPass": "hackme1",
+                "delay": 2.0
+            },
+            {
+                "stream_name": "stream_1",
+                "meta_format_idle": "[idle]",
+                "meta_format_tgid": "[%TGID%]",
+                "meta_format_tag":  "[%TGID%] %TAG%",
+                "icecastServerAddress": "192.168.1.24:8000",
+                "icecastMountpoint": "op25_stream_1",
+                "icecastMountExt": ".xspf",
+                "icecastPass": "hackme2",
+                "delay": 2.0
+            }
+        ]
+    },
+    "audio": {
+        "module": "sockaudio.py",
+        "instances": [
+            {
+                "instance_name": "audio0",
+                "device_name": "default",
+                "udp_port": 23456,
+                "audio_gain": 1.0,
+                "number_channels": 1
+            },
+            {
+                "instance_name": "audio1",
+                "device_name": "default",
+                "udp_port": 23466,
+                "audio_gain": 1.0,
+                "number_channels": 1
+            }
+        ]
+    },
+    "terminal": {
+        "module": "terminal.py",
+        "#terminal_type": "curses",
+        "terminal_type": "http:0.0.0.0:8080",
+        "curses_plot_interval": 0.1,
+        "http_plot_interval": 1.0,
+        "http_plot_directory": "../www/images",
+        "tuning_step_large": 1200,
+        "tuning_step_small": 100,
+        "default_channel": "Voice_ch2"
+    }
+}
