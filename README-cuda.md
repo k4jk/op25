@@ -13,7 +13,7 @@ dibit streams to the existing `frame_assembler` / `rx_sync` decoder stack.
 | Component | Minimum | Tested |
 |-----------|---------|--------|
 | GPU | Any CUDA-capable (compute 6.0+) | NVIDIA GeForce GTX 1080 (compute 6.1) |
-| SDR | Wideband receiver (≥ 5 MHz) | USRP B200 Mini |
+| SDR | Wideband receiver (≥ 5 MHz) | USRP B200 Mini, Airspy R2 |
 | Driver | NVIDIA driver 525+ | — |
 | CUDA Toolkit | 11.8+ | 12.8 |
 
@@ -182,7 +182,7 @@ the GPU pipeline:
     "devices": [
         {
             "name": "sdr0",
-            "args": "uhd,nchan=1,subdev=A:A,num_recv_frames=64,recv_frame_size=16360",
+            "args": "uhd,nchan=1,subdev=A:A,num_recv_frames=64 recv_frame_size=16360",
             "gains": "PGA:67",
             "frequency": 855587500,
             "rate": 10000000,
@@ -206,7 +206,7 @@ the GPU pipeline:
 | `fft_oversample` | FFT oversampling factor. `1` = critically sampled (no odd-bin penalty, recommended for most deployments). `2` = 2× oversampled (improves channel isolation at the cost of the odd-bin SNR penalty and higher GPU memory usage). |
 | `max_channels` | Maximum simultaneous voice channels the channelizer will allocate slots for. |
 
-Note: You may need to play with device buffering in the device args to make sure samples don't get dropped, the channelizer is picky about this.
+Note: You may need to play with device buffering in the device args to prevent USB overflow, depending on your setup.
 
 Example for UHD Devices: Something like num_recv_frames=64,recv_frame_size=16360
 
@@ -237,10 +237,7 @@ WARNING: no cc:true channel found for sysname=BIGSYSTEM on device=sdr0,
 defaulting to slot 0 (msgq_id=0) — add "cc": true to your CC channel config
 ```
 
-The fallback works for single-system configs, but becomes unreliable when you
-run multiple trunked systems on a single wideband SDR. In that case, each
-system needs its own dedicated CC slot, and without explicit `"cc": true` markers
-the code has no way to know which slot belongs to which system's control channel.
+The fallback works for single-system configs, as long as you also have a voice channel. But it becomes unreliable when you run multiple trunked systems on a single wideband SDR. In that case, each system needs its own dedicated CC slot, and without explicit `"cc": true` markers the code has no way to know which slot belongs to which system's control channel.
 
 Marking the CC explicitly also makes the config self-documenting and prevents
 subtle bugs if channel list order ever changes.
@@ -283,7 +280,7 @@ one decoder slot. The right number depends on the busy-hour traffic of the syste
 you are monitoring:
 
 - **One slot per simultaneous call you want to hear.** A system that routinely has
-  3–4 simultaneous voice grants needs at least 3–4 voice entries.
+  3–4 simultaneous voice grants needs at least 3–4 voice entries, if you want to hear them all.
 - **Slots consume GPU bins continuously** (once a grant is assigned, the GPU keeps
   that FFT bin active until the call ends). More slots means more GPU load, but on
   any modern GPU the per-slot cost is very small.
@@ -304,7 +301,7 @@ grants being dropped because all slots are occupied.
 - **`fft_oversample: 2`** — Doubles GPU memory and compute. Channels that land on
   odd FFT bins suffer −3.92 dB SNR. Useful if channel isolation is a concern and
   you can tolerate the SNR tradeoff. Also might be useful on 700mhz if you have a wideband device and and want to monitor multiple 
-  systems that will require 6.25khz overall channel spacing. With careful center frequency selection you may  be able to place control all channels on even bins, it depends on your exact situation.
+  systems that will require 6.25khz overall channel spacing. With careful center frequency selection you may  be able to place all channels on even bins, it depends on your exact situation.
 
 ---
 
