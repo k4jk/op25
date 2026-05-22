@@ -72,6 +72,7 @@ the standard build to avoid mixing artifacts.
 ### 1. Create a build directory
 
 ```bash
+git checkout feature/cuda-channelizer
 cd op25/gr-op25_repeater
 mkdir build_cuda && cd build_cuda
 ```
