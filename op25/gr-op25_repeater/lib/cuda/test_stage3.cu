@@ -1,4 +1,7 @@
-// Milestone 3 — M&M clock recovery + C4FM slicer unit test
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Milestone 3 — clock recovery + C4FM slicer unit test
 //
 // Generates a synthetic FM-demod signal (rectangular C4FM pulses at 4800 baud,
 // 12500 Hz sample rate) and feeds it directly into mm_process(), bypassing the
@@ -10,7 +13,7 @@
 //
 // Test:
 //   A repeating 16-dibit pattern is encoded as rectangular C4FM pulses.
-//   After 3 warmup blocks the M&M should be locked; the measurement block
+//   After 3 warmup blocks the  should be locked; the measurement block
 //   must recover all dibits with < 5% error (expected: 0 errors).
 
 #include "../../include/cuda/channelizer.h"

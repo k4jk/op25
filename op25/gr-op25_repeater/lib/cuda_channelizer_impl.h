@@ -1,6 +1,6 @@
 /* -*- c++ -*- */
 /*
- * Copyright 2024 OP25 Contributors
+ * Copyright 2026, James Kirkham K4JK
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 

@@ -1,3 +1,6 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // FM discriminator kernel — Milestone 2
 //
 // Differential phase demodulator for all M channels in parallel.

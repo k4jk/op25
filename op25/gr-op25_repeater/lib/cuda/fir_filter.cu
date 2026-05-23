@@ -1,3 +1,6 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Stage-2 per-channel decimating FIR filter — Milestone 2
 //
 // Takes the fft_size-channel stage-1 output (step-major, at stage1_output_rate_hz)

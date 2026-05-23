@@ -1,5 +1,9 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #pragma once
 
+//
 // Public C++ API for the polyphase analysis channelizer stage.
 // Functions are defined in channelizer.cu and compiled by nvcc.
 

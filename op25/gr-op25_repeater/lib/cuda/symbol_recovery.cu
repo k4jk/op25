@@ -1,3 +1,6 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Gardner clock recovery + 4-level C4FM slicer (Phase 1 FM) and
 // complex Gardner + differential decode (Phase 2 H-DQPSK and Phase 1 CQPSK)
 //

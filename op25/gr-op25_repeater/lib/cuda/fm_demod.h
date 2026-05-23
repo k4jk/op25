@@ -1,3 +1,6 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #pragma once
 
 #include "../../include/cuda/channelizer.h"

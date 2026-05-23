@@ -1,3 +1,6 @@
+// Copyright 2026, James Kirkham K4JK
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Milestone 2 — integrated pipeline test: stage-1 + stage-2 FIR + FM demod
 //
 // Build:
