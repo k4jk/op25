@@ -1,10 +1,8 @@
 # Building OP25 with the CUDA Polyphase Channelizer
 
 The CUDA channelizer replaces the per-channel GNU Radio demodulation chain with a
-single GPU pipeline that processes the full SDR bandwidth in one pass. A single
-wideband capture (e.g. 10 MHz from a B200) is polyphase-filtered and FFT-binned on
-the GPU; individual P25 channels are extracted, clock-recovered, and delivered as
-dibit streams to the existing `frame_assembler` / `rx_sync` decoder stack.
+single GPU pipeline that processes full SDR bandwidths in one pass. One or more
+wideband captures are polyphase-filtered and FFT-binned on the GPU; individual P25 channels are extracted, clock-recovered, and delivered as dibit streams to the existing `frame_assembler` / `rx_sync` decoder stack.
 
 ---
 
@@ -69,7 +67,7 @@ The CUDA channelizer is built as part of `gr-op25_repeater`. It is **disabled by
 default** and enabled with `-DENABLE_CUDA=ON`. Use a separate build directory from
 the standard build to avoid mixing artifacts.
 
-### 1. Create a build directory
+### 1. Checkout CUDA branch & create a build directory
 
 ```bash
 git checkout feature/cuda-channelizer
@@ -145,8 +143,8 @@ You should see `cuda_channelizer` in the output.
 
 ### channelizer.json
 
-The GPU pipeline is configured by `channelizer.json` (located in the `apps/`
-directory alongside your run script). The path is referenced by the `"channelizer"`
+The GPU pipeline core is configured by `channelizer.json` (located in the `apps/`
+directory alongside your other configs). The path is referenced by the `"channelizer"`
 key in your main config file.
 
 ```json
@@ -204,7 +202,7 @@ the GPU pipeline:
 | Field | Description |
 |---|---|
 | `cuda` | `true` to route this device through the GPU channelizer. |
-| `fft_oversample` | FFT oversampling factor. `1` = critically sampled (no odd-bin penalty, recommended for most deployments). `2` = 2× oversampled (improves channel isolation at the cost of the odd-bin SNR penalty and higher GPU memory usage). |
+| `fft_oversample` | FFT oversampling factor. `1` = critically sampled 12.5 khz bins (no odd-bin penalty, recommended for most deployments). `2` = 2× oversampled (improves channel isolation at the cost of the odd-bin SNR penalty and higher GPU memory usage). See section below on FFT oversampling.|
 | `max_channels` | Maximum simultaneous voice channels the channelizer will allocate slots for. |
 
 Note: You may need to play with device buffering in the device args to prevent USB overflow, depending on your setup.
@@ -299,10 +297,9 @@ grants being dropped because all slots are occupied.
 
 - **`fft_oversample: 1`** — Recommended for most deployments. No odd-bin SNR
   penalty. Each FFT bin corresponds to exactly one 12.5 kHz channel.
-- **`fft_oversample: 2`** — Doubles GPU memory and compute. Channels that land on
-  odd FFT bins suffer −3.92 dB SNR. Useful if channel isolation is a concern and
-  you can tolerate the SNR tradeoff. Also might be useful on 700mhz if you have a wideband device and and want to monitor multiple 
-  systems that will require 6.25khz overall channel spacing. With careful center frequency selection you may  be able to place all channels on even bins, it depends on your exact situation.
+- **`fft_oversample: 2`** — Can be used when 6.25 khz channelization is needed. Doubles GPU memory and compute. Additionally, channels that land on ODD FFT bins suffer −3.92 dB SNR. Mainly useful on 700mhz when using a wideband device to monitor multiple systems. Essentially, oversampling for 6.25 mhz channelization can allow you to monitor multiple frequencies on a single device when they do not fall neatly in multiples of 12.5 khz.
+
+ Before resorting to oversampling, you may be able to place all channels on even 12.5 khz bins with careful center frequency selection in your SDR device config. It depends on your exact situation, and the systems you are trying to monitor. With critical sampling, the channelizer will create 12.5 khz bins by default to cover the entire sample bandwidth, based on the the center frequency & offset set in the device config.
 
 ---
 
@@ -351,3 +348,55 @@ odd (e.g. 25) and consider adjusting center frequency.
 **Channels time out immediately after grant with no audio**
 Confirm `rx_q` in `multi_rx.py` is set to `gr.msg_queue(1000)` (not 100). The
 smaller queue silently drops timeout messages during control channel floods.
+
+**Architecture Diagram**
+
+══════════════════════════════════════════════════════════════
+                        GPU SIDE
+══════════════════════════════════════════════════════════════
+
+SDR wideband IQ streams (any GNU Radio compatible devices)
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│            CUDA Polyphase Channelizer               │
+│                                                     │
+│  • Channel extraction (polyphase filter bank)       │
+│  • Nyquist carrier removal (decarrier — odd bins)   │
+│  • Per-bin frequency derotation (Δf correction)     │
+│  • Per-channel S2 FIR filtering + decimation        │
+│                                                     │
+│  MODE 1 — FM/FSK4 path (fsk4 demod_type):          │
+│  • IIR DC blocker (alpha=0.99)                      │
+│  • FM demodulation                                  │
+│  • C4FM matched filter                              │
+│  • Gardner TED (real FM samples, raw IQ S-curve)    │
+│  • FSK4 slicer → dibits                             │
+│                                                     │
+│  MODE 2/3 — CQPSK path (cqpsk demod_type):         │
+│  • IQ Gardner TED (complex, raw IQ S-curve)         │
+│  • MMSE FIR interpolator (GNU Radio coefficients)   │
+│  • Differential IQ decoder (curr × conj(prev))      │
+│  • Costas loop (4th-order, α=0.008)                 │
+│  • DQPSK slicer → dibits                            │
+│                                                     │
+│  Both paths:                                        │
+│  • 8-tap MMSE FIR interpolator                      │
+│  • MM_HIST=12 history samples                       │
+│  • Warmup gate (126-step freeze on channel assign)  │
+│  • Raw P25 dibit stream output                      │
+└─────────────────────────────────────────────────────┘
+        │
+        │  raw P25 symbols (tiny bandwidth — ~24 KB/s total)
+        ▼
+══════════════════════════════════════════════════════════════
+                        CPU SIDE  (OP25 — unchanged)
+══════════════════════════════════════════════════════════════
+        │
+        ▼
+op25_repeater.frame_assembler — frame assembly, error correction
+        │
+trunking.py              — protocol state machine, grants/releases
+        │
+audio output             — IMBE/AMBE vocoder, playback
+══════════════════════════════════════════════════════════════
