@@ -350,7 +350,7 @@ Confirm `rx_q` in `multi_rx.py` is set to `gr.msg_queue(1000)` (not 100). The
 smaller queue silently drops timeout messages during control channel floods.
 
 **Architecture Diagram**
-
+```
 ══════════════════════════════════════════════════════════════
                         GPU SIDE
 ══════════════════════════════════════════════════════════════
@@ -400,3 +400,4 @@ trunking.py              — protocol state machine, grants/releases
         │
 audio output             — IMBE/AMBE vocoder, playback
 ══════════════════════════════════════════════════════════════
+```
