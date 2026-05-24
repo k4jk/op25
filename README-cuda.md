@@ -1,8 +1,14 @@
-# Building OP25 with the CUDA Polyphase Channelizer
+# Building & Running OP25 with the CUDA Polyphase Channelizer
 
-The CUDA channelizer replaces the per-channel GNU Radio demodulation chain with a
-single GPU pipeline that processes full SDR bandwidths in one pass. One or more
-wideband captures are polyphase-filtered and FFT-binned on the GPU; individual P25 channels are extracted, clock-recovered, and delivered as dibit streams to the existing `frame_assembler` / `rx_sync` decoder stack.
+The CUDA channelizer replaces the per-channel GNU Radio demodulation chain with a single GPU pipeline that processes full SDR bandwidths in one pass. The goal is to offload all RF signal processing (channelization, filtering, demodulation, symbol recovery) to an NVIDIA GPU, freeing the CPU to run OP25's existing protocol logic and audio processing unchanged. This greatly reduces the stress on the CPU, especially when wideband sampling is needed.
+
+The channelizer accepts any complex IQ stream from any GNU Radio SDR source block.
+
+One or more wideband captures are polyphase-filtered and FFT-binned on the GPU; individual 12.5 khz P25 channels are extracted, clock-recovered, and delivered as dibit streams to the existing `frame_assembler` / `rx_sync` decoder stack.
+
+On each instance, the control channel is handled as slot 0 — a permanently allocated channel slot fed into OP25's existing p25_decoder block. OP25 control channel processing is unchanged, producing grant/release events that drive the channel manager. This avoids reimplementing any P25 protocol logic and keeps OP25's proven control channel state machine fully intact.
+
+If you use OP25 with a couple of RTL dongles or an airspy and are happy with it, this probably isn't for you. But if you are interested in wideband sampling with multiple high-performance SDR devices, read on.
 
 ---
 
@@ -238,8 +244,7 @@ defaulting to slot 0 (msgq_id=0) — add "cc": true to your CC channel config
 
 The fallback works for single-system configs, as long as you also have a voice channel. But it becomes unreliable when you run multiple trunked systems on a single wideband SDR. In that case, each system needs its own dedicated CC slot, and without explicit `"cc": true` markers the code has no way to know which slot belongs to which system's control channel.
 
-Marking the CC explicitly also makes the config self-documenting and prevents
-subtle bugs if channel list order ever changes.
+Marking the CC explicitly also makes the config self-documenting and prevents subtle bugs if channel list order ever changes.
 
 ```json
 {
