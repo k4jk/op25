@@ -152,7 +152,15 @@ static __device__ int8_t symbol_to_dibit(float d)
 
 // 4th-order Costas loop bandwidth for Phase 1 CQPSK (mode 3).
 // Matches digital.costas_loop_cc(alpha=0.008, order=4) in the CPU reference.
-static constexpr float COSTAS_ALPHA = 0.008f;
+// COSTAS_BETA follows the standard second-order PLL critically-damped relation: β = α²/4.
+static constexpr float COSTAS_ALPHA    = 0.008f;
+static constexpr float COSTAS_BETA     = COSTAS_ALPHA * COSTAS_ALPHA / 4.0f;
+static constexpr float COSTAS_MAX_FREQ = 0.01f;   // [rad/symbol] frequency integrator clamp
+
+// Phase slip detection window.  The signed slip counter increments on outer
+// symbols (|phase_dc| > π/2) and decrements on inner symbols (|phase_dc| < π/2).
+// When it saturates at ±COSTAS_SLIP_WIN the Costas phase is snapped by ∓π/2.
+static constexpr int   COSTAS_SLIP_WIN = 50;
 
 // 4-level slicer for P25 Phase 2 H-DQPSK.
 // Input y = differential phase (radians), DC-corrected.
@@ -192,6 +200,9 @@ __global__ void mm_recovery_kernel(
     const float* __restrict__ d_derot_step,       // [C] per-sample IQ derotation phase [rad/sample] (0 = off)
     float*                    d_derot_acc,        // [C] accumulated derotation phase at batch start (in/out)
     float*                    d_costas_phase,     // [C] Costas loop phase accumulator (mode 3 only, in/out)
+    float*                    d_costas_freq,      // [C] Costas frequency integrator (mode 3 only, in/out)
+    int32_t*                  d_costas_slip_ctr,  // [C] signed slip-detection counter (mode 3 only, in/out)
+    int debug,
     int C, int in_steps,
     float sps_p1, float sps_p2)                   // nominal sps for each mode
 {
@@ -317,8 +328,10 @@ __global__ void mm_recovery_kernel(
         // slightly wrong but clamped to ±1 and corrected quickly.
         cufftComplex last_sym_raw = last_sym_c;
 
-        // Costas loop phase accumulator (mode 3 only; 0 for mode 2).
-        float costas_phase = (mode == 3) ? d_costas_phase[k] : 0.0f;
+        // Costas loop state (mode 3 only; 0 for mode 2).
+        float   costas_phase = (mode == 3) ? d_costas_phase[k]    : 0.0f;
+        float   costas_freq  = (mode == 3) ? d_costas_freq[k]     : 0.0f;
+        int32_t slip_ctr     = (mode == 3) ? d_costas_slip_ctr[k] : 0;
 
         // Per-bin carrier derotation: removes residual Δf = channel_freq - bin_center.
         // derot_acc is the accumulated phase at the start of this batch.
@@ -381,15 +394,48 @@ __global__ void mm_recovery_kernel(
             float e;
 
             if (mode == 3) {
+                // Gardner timing error on raw IQ (no normalization — constant-envelope
+                // CQPSK timing information lives in the amplitude envelope at transitions;
+                // normalization destroys the S-curve restoring force).
                 float diff_re = last_sym_raw.x - curr.x;
                 float diff_im = last_sym_raw.y - curr.y;
                 e = diff_re * mid.x + diff_im * mid.y;
                 last_sym_raw = curr;
 
-                curr_for_diff = curr;
-                float amp = sqrtf(curr.x * curr.x + curr.y * curr.y);
+                // ── Pre-differential Costas rotation ──
+                // Rotate curr by -costas_phase so the differential decode sees a
+                // phase-coherent signal.  The error is computed from the corrected IQ
+                // directly (not from the differential output), giving the loop a true
+                // restoring force against absolute constellation rotation.
+                float cp, sp;
+                __sincosf(-costas_phase, &sp, &cp);
+                cufftComplex curr_rot;
+                curr_rot.x = curr.x * cp - curr.y * sp;
+                curr_rot.y = curr.x * sp + curr.y * cp;
+
+                // Normalize for differential decode and Costas error.
+                curr_for_diff = curr_rot;
+                float amp = sqrtf(curr_rot.x * curr_rot.x + curr_rot.y * curr_rot.y);
                 if (amp > 1e-5f) { curr_for_diff.x /= amp; curr_for_diff.y /= amp; }
+
+                // 4th-order Costas error from corrected normalized IQ.
+                // Zeros at ±π/4, ±3π/4 (the QPSK constellation points).
+                float sgn_i = (curr_for_diff.x >= 0.0f) ? 1.0f : -1.0f;
+                float sgn_q = (curr_for_diff.y >= 0.0f) ? 1.0f : -1.0f;
+                float costas_err = sgn_i * curr_for_diff.y - sgn_q * curr_for_diff.x;
+                if (costas_err >  1.0f) costas_err =  1.0f;
+                if (costas_err < -1.0f) costas_err = -1.0f;
+
+                // Second-order PLL update (β = α²/4 for critical damping).
+                costas_freq  += COSTAS_BETA * costas_err;
+                if (costas_freq >  COSTAS_MAX_FREQ) costas_freq =  COSTAS_MAX_FREQ;
+                if (costas_freq < -COSTAS_MAX_FREQ) costas_freq = -COSTAS_MAX_FREQ;
+                costas_phase += costas_freq + COSTAS_ALPHA * costas_err;
+                if (costas_phase >  3.14159265f) costas_phase -= 6.28318530f;
+                if (costas_phase < -3.14159265f) costas_phase += 6.28318530f;
+
             } else {
+                // Mode 2 H-DQPSK: unit-normalized Gardner, no Costas.
                 cufftComplex cn = curr, mn = mid;
                 float ca = sqrtf(cn.x * cn.x + cn.y * cn.y);
                 if (ca > 1e-5f) { cn.x /= ca; cn.y /= ca; }
@@ -409,36 +455,17 @@ __global__ void mm_recovery_kernel(
             if (omega > sps_max) omega = sps_max;
             mu += omega + gain_mu * e;
 
-            // Differential decode: curr_for_diff × conj(last_sym_c)
+            // Differential decode: curr_for_diff × conj(last_sym_c).
+            // For mode 3, curr_for_diff is Costas-corrected; last_sym_c stores
+            // the previous Costas-corrected symbol, so the differential is coherent.
             float d_re = curr_for_diff.x * last_sym_c.x + curr_for_diff.y * last_sym_c.y;
             float d_im = curr_for_diff.y * last_sym_c.x - curr_for_diff.x * last_sym_c.y;
 
             last_sym_c = curr_for_diff;
 
-            // Costas loop (mode 3 only) — 4th-order phase detector.
-            // Breaks the Gardner symmetry between symbol-center and symbol-midpoint
-            // zero-crossings by adding a phase-coherent restoring force.
-            // Rotates the differential phasor by -costas_phase to correct the
-            // accumulated carrier offset; updates costas_phase via
-            //   error = sgn(I)·Q − sgn(Q)·I  (zero at ±π/4 and ±3π/4 only).
-            float phase;
-            if (mode == 3) {
-                float cp, sp;
-                __sincosf(costas_phase, &sp, &cp);
-                float cor_re =  d_re * cp + d_im * sp;
-                float cor_im = -d_re * sp + d_im * cp;
-                float sgn_i = (cor_re >= 0.0f) ? 1.0f : -1.0f;
-                float sgn_q = (cor_im >= 0.0f) ? 1.0f : -1.0f;
-                float costas_err = sgn_i * cor_im - sgn_q * cor_re;
-                if (costas_err >  1.0f) costas_err =  1.0f;
-                if (costas_err < -1.0f) costas_err = -1.0f;
-                costas_phase += COSTAS_ALPHA * costas_err;
-                if (costas_phase >  3.14159265f) costas_phase -= 6.28318530f;
-                if (costas_phase < -3.14159265f) costas_phase += 6.28318530f;
-                phase = atan2f(cor_im, cor_re);
-            } else {
-                phase = atan2f(d_im, d_re);
-            }
+            // Phase for decision: for mode 3 Costas is already applied pre-differential;
+            // for mode 2 there is no Costas — both use the raw differential angle.
+            float phase = atan2f(d_im, d_re);
 
             // DC removal: tracks residual carrier offset after derotation
             // (SDR oscillator error etc.).  For mode 3, suppress dc_est updates
@@ -453,6 +480,39 @@ __global__ void mm_recovery_kernel(
             d_symbols[n_sym * C + k] = phase_dc;
             d_dibits [n_sym * C + k] = dqpsk_to_dibit(phase_dc);
             n_sym++;
+
+            // Phase slip detection (mode 3 only).
+            // slip_ctr is a signed saturating counter: outer symbols drive it toward
+            // ±COSTAS_SLIP_WIN; inner symbols decay it toward 0.  When it saturates,
+            // costas_phase is snapped by ∓π/2 to escape the wrong 90° lock point.
+            if (mode == 3) {
+                const float HALF_PI = 1.5707963f;
+                if (phase_dc > HALF_PI) {
+                    slip_ctr = min(slip_ctr + 1,  COSTAS_SLIP_WIN);
+                } else if (phase_dc < -HALF_PI) {
+                    slip_ctr = max(slip_ctr - 1, -COSTAS_SLIP_WIN);
+                } else {
+                    // inner symbol: decay counter one step toward 0
+                    if      (slip_ctr > 0) slip_ctr--;
+                    else if (slip_ctr < 0) slip_ctr++;
+                }
+
+                if (slip_ctr >= COSTAS_SLIP_WIN) {
+                    // outer symbols dominated with positive phase → slipped +π/2 → correct by -π/2
+                    costas_phase -= HALF_PI;
+                    if (costas_phase < -3.14159265f) costas_phase += 6.28318530f;
+                    slip_ctr = 0;
+                    if (debug) printf("Costas slip corrected: slot=%d bin=%d snap=%.4f\n",
+                                      0, k, -HALF_PI);
+                } else if (slip_ctr <= -COSTAS_SLIP_WIN) {
+                    // outer symbols dominated with negative phase → slipped -π/2 → correct by +π/2
+                    costas_phase += HALF_PI;
+                    if (costas_phase >  3.14159265f) costas_phase -= 6.28318530f;
+                    slip_ctr = 0;
+                    if (debug) printf("Costas slip corrected: slot=%d bin=%d snap=%.4f\n",
+                                      0, k, +HALF_PI);
+                }
+            }
         }
 
         // Save MM_HIST most-recent IQ samples as DEROTATED history for next batch.
@@ -471,7 +531,11 @@ __global__ void mm_recovery_kernel(
             }
         }
         d_last_sym_c[k] = last_sym_c;
-        if (mode == 3) d_costas_phase[k] = costas_phase;
+        if (mode == 3) {
+            d_costas_phase[k]    = costas_phase;
+            d_costas_freq[k]     = costas_freq;
+            d_costas_slip_ctr[k] = slip_ctr;
+        }
 
         // Advance and wrap the phase accumulator so float precision doesn't drift
         // over thousands of batches.
@@ -563,15 +627,23 @@ bool mm_alloc(ChannelizerState& state)
     cudaMemset(state.d_iq_derot_step, 0, static_cast<size_t>(C) * sizeof(float));
     cudaMemset(state.d_iq_derot_acc,  0, static_cast<size_t>(C) * sizeof(float));
 
-    // Costas loop phase accumulator (mode 3 only; stays zero for modes 1/2)
+    // Costas loop state (mode 3 only; stays zero for modes 1/2)
     CUDA_CHECK_MM(cudaMalloc(&state.d_costas_phase,
                              static_cast<size_t>(C) * sizeof(float)));
     cudaMemset(state.d_costas_phase, 0, static_cast<size_t>(C) * sizeof(float));
 
+    CUDA_CHECK_MM(cudaMalloc(&state.d_costas_freq,
+                             static_cast<size_t>(C) * sizeof(float)));
+    cudaMemset(state.d_costas_freq, 0, static_cast<size_t>(C) * sizeof(float));
+
+    CUDA_CHECK_MM(cudaMalloc(&state.d_costas_slip_ctr,
+                             static_cast<size_t>(C) * sizeof(int32_t)));
+    cudaMemset(state.d_costas_slip_ctr, 0, static_cast<size_t>(C) * sizeof(int32_t));
+
     return true;
 }
 
-void mm_process(ChannelizerState& state, int in_steps)
+void mm_process(ChannelizerState& state, int in_steps, int debug)
 {
     const int C = state.config.fft_size;
 
@@ -598,6 +670,9 @@ void mm_process(ChannelizerState& state, int in_steps)
         state.d_iq_derot_step,
         state.d_iq_derot_acc,
         state.d_costas_phase,
+        state.d_costas_freq,
+        state.d_costas_slip_ctr,
+        debug,
         C, in_steps, sps_p1, sps_p2);
 }
 
@@ -619,5 +694,7 @@ void mm_free(ChannelizerState& state)
     if (state.d_mm_in_warmup)   { cudaFree(state.d_mm_in_warmup);   state.d_mm_in_warmup   = nullptr; }
     if (state.d_iq_derot_step)  { cudaFree(state.d_iq_derot_step);  state.d_iq_derot_step  = nullptr; }
     if (state.d_iq_derot_acc)   { cudaFree(state.d_iq_derot_acc);   state.d_iq_derot_acc   = nullptr; }
-    if (state.d_costas_phase)   { cudaFree(state.d_costas_phase);   state.d_costas_phase   = nullptr; }
+    if (state.d_costas_phase)    { cudaFree(state.d_costas_phase);    state.d_costas_phase    = nullptr; }
+    if (state.d_costas_freq)     { cudaFree(state.d_costas_freq);     state.d_costas_freq     = nullptr; }
+    if (state.d_costas_slip_ctr) { cudaFree(state.d_costas_slip_ctr); state.d_costas_slip_ctr = nullptr; }
 }

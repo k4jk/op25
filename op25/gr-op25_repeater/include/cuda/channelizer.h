@@ -168,6 +168,8 @@ struct ChannelizerState {
     // normalized differential phasor.  Breaks the Gardner S-curve symmetry
     // between symbol-center and symbol-midpoint zero-crossings.
     // alpha = 0.008 (matches digital.costas_loop_cc(alpha=0.008, order=4)).
-    float*          d_costas_phase;   // [C] accumulated phase correction [rad]; 0 for modes 1/2
+    float*          d_costas_phase;     // [C] accumulated phase correction [rad]; 0 for modes 1/2
+    float*          d_costas_freq;      // [C] frequency integrator [rad/symbol]; 0 for modes 1/2
+    int32_t*        d_costas_slip_ctr;  // [C] signed slip-detection counter; snaps phase on ±SLIP_WIN
 #endif
 };

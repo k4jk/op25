@@ -17,7 +17,7 @@ If you use OP25 with a couple of RTL dongles or an airspy and are happy with it,
 | Component | Minimum | Tested |
 |-----------|---------|--------|
 | GPU | Any CUDA-capable (compute 6.0+) | NVIDIA GeForce GTX 1080 (compute 6.1) |
-| SDR | Wideband receiver (≥ 5 MHz) | USRP B200 Mini, Airspy R2 |
+| SDR | Wideband receiver (≥ 5 MHz) | BladeRF Micro 2.0, USRP B200 Mini, Airspy R2 |
 | Driver | NVIDIA driver 525+ | — |
 | CUDA Toolkit | 11.8+ | 12.8 |
 

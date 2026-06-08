@@ -47,6 +47,6 @@ bool mm_alloc(ChannelizerState& state);
 //   state.d_mm_sym_count[M]               (int32_t, valid symbols per channel)
 //
 // Per-channel mode is set via d_channel_mode (updated by apply_pending_mm_resets).
-void mm_process(ChannelizerState& state, int in_steps);
+void mm_process(ChannelizerState& state, int in_steps, int debug = 0);
 
 void mm_free(ChannelizerState& state);

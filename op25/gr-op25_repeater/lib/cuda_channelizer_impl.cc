@@ -894,7 +894,7 @@ void cuda_channelizer_impl::run_gpu_batch(const void* cpu_iq_buf)
                 cudaMemcpy(d_state.d_mm_in_warmup + b, &one8, sizeof(int8_t), cudaMemcpyHostToDevice);
         }
     }
-    mm_process(d_state, out_steps);
+    mm_process(d_state, out_steps, d_debug);
 
     // Download results using the pipeline stream
     cudaMemcpyAsync(d_h_counts.data(), d_state.d_mm_sym_count,
@@ -1066,8 +1066,11 @@ void cuda_channelizer_impl::apply_pending_mm_resets()
             // Apply Costas seed computed in set_channel() (mode 3) or 0 (mode 2).
             // Mode 3 voice channels are seeded from the CC's converged phase so
             // the Costas PD starts in the correct 4th-order lock basin immediately.
+            // costas_freq always resets to 0 — the frequency integrator starts fresh
+            // each call so it doesn't carry stale drift from the previous channel.
             const float costas_init = d_bin_costas_seed[k];
-            cudaMemcpy(d_state.d_costas_phase  + k, &costas_init, sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_costas_phase + k, &costas_init, sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_state.d_costas_freq  + k, &zero,        sizeof(float), cudaMemcpyHostToDevice);
         } else {
             // Phase 1 FM/FSK4 (mode 1): reset real FM history and last raw symbol
             for (int h = 0; h < MM_HIST; h++)
@@ -1157,19 +1160,24 @@ void cuda_channelizer_impl::print_iq_diagnostics(int out_steps)
         cudaMemcpy(&h_omega,  d_state.d_mm_omega     + bin, sizeof(float),   cudaMemcpyDeviceToHost);
         cudaMemcpy(&h_fast,   d_state.d_mm_fast_ctr  + bin, sizeof(int32_t), cudaMemcpyDeviceToHost);
         cudaMemcpy(&h_warmup, d_state.d_mm_in_warmup + bin, sizeof(int8_t),  cudaMemcpyDeviceToHost);
-        // derot_step and costas_seed are CPU-side; costas_phase needs a GPU read.
+        // derot_step and costas_seed are CPU-side; costas_phase/freq need GPU reads.
         const float h_derot = d_bin_derot_step[bin];
-        float h_costas = 0.0f;
-        if (ss.mode == 3)
-            cudaMemcpy(&h_costas, d_state.d_costas_phase + bin, sizeof(float),
+        float h_costas = 0.0f, h_costas_freq = 0.0f;
+        if (ss.mode == 3) {
+            cudaMemcpy(&h_costas,      d_state.d_costas_phase + bin, sizeof(float),
                        cudaMemcpyDeviceToHost);
+            cudaMemcpy(&h_costas_freq, d_state.d_costas_freq  + bin, sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        }
 
         fprintf(stderr,
             "[IQDIAG] bin=%-4d mode=%d | sync_magic=%d sync_revp=%d\n"
             "         dc_est=%.4f  fast_ctr=%d  warmup=%d  mu=%.3f  omega=%.4f"
-            "  sym/batch=%d  derot=%.6f rad/samp  costas=%.4f rad\n",
+            "  sym/batch=%d  derot=%.6f rad/samp"
+            "  costas_phase=%.4f rad  costas_freq=%.6f rad/sym\n",
             bin, (int)ss.mode, ss.sync_magic, ss.sync_revp,
-            h_dc, h_fast, (int)h_warmup, h_mu, h_omega, ss.n_sym, h_derot, h_costas);
+            h_dc, h_fast, (int)h_warmup, h_mu, h_omega, ss.n_sym, h_derot,
+            h_costas, h_costas_freq);
 
         if (ss.mode == 1) {
             fprintf(stderr, "         (mode 1 FM — no IQ analysis)\n");
