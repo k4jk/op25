@@ -146,10 +146,23 @@ private:
     // Fires at batch 50 (~0.3 s) then every 500 batches (~3 s) thereafter.
     int d_diag_batch_ctr{0};
 
+    // ---- Costas PPM convergence tracker ------------------------------------
+    // When costas_freq stays within ±10% of a reference value for
+    // COSTAS_PPM_STABLE_CHECKS consecutive checks (each COSTAS_PPM_CHECK_INTERVAL
+    // batches apart), log a suggested PPM trim to eliminate the residual offset.
+    struct CostasStabState {
+        float ref_freq;   // reference costas_freq for stability comparison [rad/sym]
+        int   stable_ctr; // consecutive in-tolerance checks
+        bool  reported;   // true once the suggestion has been logged for this assignment
+    };
+    std::vector<CostasStabState> d_costas_stab;  // [max_channels]
+    int d_ppm_batch_ctr{0};
+
     bool alloc_pipeline(const std::string& config_path);
     void run_gpu_batch(const void* cpu_iq_buf);
     void apply_pending_mm_resets();   // called from run_gpu_batch(), default stream
     void print_iq_diagnostics(int out_steps); // periodic IQ health report to stderr
+    void check_costas_ppm_convergence();      // periodic PPM trim suggestion
     void free_pipeline();
 
     // Frequency → polyphase bin (wraps into [0, M))

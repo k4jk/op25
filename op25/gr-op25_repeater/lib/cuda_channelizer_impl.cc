@@ -83,6 +83,7 @@ cuda_channelizer_impl::cuda_channelizer_impl(const std::string& config_path,
     d_h_counts.resize(d_fft_size);
     d_h_dibits.resize(static_cast<size_t>(MM_MAX_SYM) * d_fft_size);
     d_accum_buf.resize(d_input_len);
+    d_costas_stab.assign(d_max_channels, {0.0f, 0, false});
 
     set_tag_propagation_policy(TPP_DONT);
 
@@ -211,6 +212,7 @@ void cuda_channelizer_impl::set_channel(int slot, float center_freq_hz,
         d_sync_sr[slot]        = 0;
         d_sync_count[slot]     = 0;
         d_sync_rev_count[slot] = 0;
+        d_costas_stab[slot]    = {0.0f, 0, false};
         d_bin_reset_pending[bin] = true;
         // Arm warmup counter immediately so that if set_channel fires between
         // apply_pending_mm_resets() and mm_process() in the same batch the counter
@@ -905,6 +907,7 @@ void cuda_channelizer_impl::run_gpu_batch(const void* cpu_iq_buf)
     cudaStreamSynchronize(d_pipeline_stream);
 
     print_iq_diagnostics(out_steps);
+    check_costas_ppm_convergence();
 
 #ifdef CUDA_DIAG
     static int diag_counter = 0;
@@ -1112,6 +1115,71 @@ void cuda_channelizer_impl::apply_pending_mm_resets()
 // Valid P25: odd buckets (1,3,5,7) >> even buckets (0,2,4,6).
 // Random noise or bad derotation: all 8 buckets roughly equal.
 // ---------------------------------------------------------------------------
+void cuda_channelizer_impl::check_costas_ppm_convergence()
+{
+#ifdef HAVE_CUDA
+    // Check every COSTAS_PPM_CHECK_INTERVAL batches to amortise GPU reads.
+    static constexpr int   COSTAS_PPM_CHECK_INTERVAL = 50;   // batches between samples
+    static constexpr int   COSTAS_PPM_STABLE_CHECKS  = 100;  // 100×50 = 5000 batches ≈ 32 s
+    static constexpr float COSTAS_PPM_STABLE_TOL     = 0.10f;// ±10% of reference value
+    static constexpr float COSTAS_PPM_MIN_ABS_TOL    = 5e-5f;// minimum absolute tolerance
+
+    if (++d_ppm_batch_ctr % COSTAS_PPM_CHECK_INTERVAL != 0)
+        return;
+
+    const float bin_hz    = d_channel_bw_hz * static_cast<float>(d_M)
+                          / static_cast<float>(d_fft_size);
+    const float sym_rate  = 4800.0f;
+    const float two_pi    = 6.28318530718f;
+
+    for (int s = 0; s < d_max_channels; s++) {
+        if (d_slot_to_mode[s] != 3) continue;
+        const int bin = d_slot_to_bin[s];
+        if (bin < 0) continue;
+
+        float h_freq = 0.0f;
+        cudaMemcpy(&h_freq, d_state.d_costas_freq + bin,
+                   sizeof(float), cudaMemcpyDeviceToHost);
+
+        auto& st = d_costas_stab[s];
+        if (st.reported) continue;
+
+        if (st.stable_ctr == 0) {
+            // First sample: seed reference.
+            st.ref_freq   = h_freq;
+            st.stable_ctr = 1;
+            continue;
+        }
+
+        const float tol = std::max(std::abs(st.ref_freq) * COSTAS_PPM_STABLE_TOL,
+                                   COSTAS_PPM_MIN_ABS_TOL);
+        if (std::abs(h_freq - st.ref_freq) <= tol) {
+            if (++st.stable_ctr >= COSTAS_PPM_STABLE_CHECKS) {
+                // costas_freq has been stable for ~5000 batches — compute PPM suggestion.
+                // Unwrap bin index: bins > fft_size/2 represent negative offsets.
+                int b = bin;
+                if (b > d_fft_size / 2) b -= d_fft_size;
+                const float ch_freq_hz = d_sdr_center_freq_hz
+                                       + static_cast<float>(b) * bin_hz;
+                const float f_error_hz = st.ref_freq * sym_rate / two_pi;
+                const float ppm_adj    = f_error_hz / ch_freq_hz * 1.0e6f;
+
+                fprintf(stderr,
+                    "[cuda_channelizer] PPM trim suggestion: slot=%d bin=%d"
+                    "  costas_freq=%.6f rad/sym  residual=%.2f Hz"
+                    "  → add %.4f ppm to your ppm= config\n",
+                    s, bin, st.ref_freq, f_error_hz, ppm_adj);
+                st.reported = true;
+            }
+        } else {
+            // Value drifted outside tolerance — restart tracking from here.
+            st.ref_freq   = h_freq;
+            st.stable_ctr = 1;
+        }
+    }
+#endif
+}
+
 void cuda_channelizer_impl::print_iq_diagnostics(int out_steps)
 {
     ++d_diag_batch_ctr;

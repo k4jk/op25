@@ -152,10 +152,13 @@ static __device__ int8_t symbol_to_dibit(float d)
 
 // 4th-order Costas loop bandwidth for Phase 1 CQPSK (mode 3).
 // Matches digital.costas_loop_cc(alpha=0.008, order=4) in the CPU reference.
-// COSTAS_BETA follows the standard second-order PLL critically-damped relation: β = α²/4.
+// COSTAS_BETA is set well below α²/4 (the critically-damped value for high SNR) because
+// on weak signals the per-symbol error estimate is too noisy for the integrator to converge
+// at the theoretical rate — it integrates noise instead.  The slower β lets the loop
+// average down the noise before committing to a frequency estimate.
 static constexpr float COSTAS_ALPHA    = 0.008f;
-static constexpr float COSTAS_BETA     = COSTAS_ALPHA * COSTAS_ALPHA / 4.0f;
-static constexpr float COSTAS_MAX_FREQ = 0.01f;   // [rad/symbol] frequency integrator clamp
+static constexpr float COSTAS_BETA     = 0.000002f;   // 8× below α²/4; noise-safe for weak signals
+static constexpr float COSTAS_MAX_FREQ = 0.020f;      // ±15.3 Hz at 4800 sym/s; covers TCXO thermal drift in either direction
 
 // Phase slip detection window.  The signed slip counter increments on outer
 // symbols (|phase_dc| > π/2) and decrements on inner symbols (|phase_dc| < π/2).
@@ -426,11 +429,17 @@ __global__ void mm_recovery_kernel(
                 if (costas_err >  1.0f) costas_err =  1.0f;
                 if (costas_err < -1.0f) costas_err = -1.0f;
 
-                // Second-order PLL update (β = α²/4 for critical damping).
-                costas_freq  += COSTAS_BETA * costas_err;
+                // Second-order PLL update — amplitude-weighted to match the CPU chain
+                // where rms_agc normalizes before Costas so loop gain scales with SNR.
+                // amp capped at 1.0 substitutes for AGC: weak signal backs off both
+                // α and β, preventing costas_freq drift on noise and loss-of-lock.
+                // costas_freq carry-forward is unconditional — only new error
+                // increments (α and β terms) are amplitude-gated.
+                amp = fminf(amp, 1.0f);
+                costas_freq  += COSTAS_BETA * costas_err * amp;
                 if (costas_freq >  COSTAS_MAX_FREQ) costas_freq =  COSTAS_MAX_FREQ;
                 if (costas_freq < -COSTAS_MAX_FREQ) costas_freq = -COSTAS_MAX_FREQ;
-                costas_phase += costas_freq + COSTAS_ALPHA * costas_err;
+                costas_phase += costas_freq + COSTAS_ALPHA * costas_err * amp;
                 if (costas_phase >  3.14159265f) costas_phase -= 6.28318530f;
                 if (costas_phase < -3.14159265f) costas_phase += 6.28318530f;
 
@@ -450,7 +459,13 @@ __global__ void mm_recovery_kernel(
             if (e >  1.0f) e =  1.0f;
             if (e < -1.0f) e = -1.0f;
 
-            omega += gain_omega * e;
+            // Amplitude-weighted omega update — matches gardner_cc_impl.cc line 187:
+            //   d_omega += d_gain_omega * symbol_error * abs(interp_samp)
+            // Without upstream AGC, raw IQ amplitude at the symbol point tracks SNR.
+            // Weak signal → small iq_amp → reduced omega wander → stable timing.
+            // Cap at 1.0 substitutes for AGC so high-gain SDR setups don't over-step.
+            float iq_amp = fminf(sqrtf(curr.x * curr.x + curr.y * curr.y), 1.0f);
+            omega += gain_omega * e * iq_amp;
             if (omega < sps_min) omega = sps_min;
             if (omega > sps_max) omega = sps_max;
             mu += omega + gain_mu * e;
